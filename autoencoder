@@ -1,0 +1,309 @@
+# -*- coding: utf-8 -*-
+"""
+@author: vicre
+
+This code is destined to optimize the hyperparameters of an Autoencoder Neural Network used
+to compress fingerprints to a 32-dimensional latent representation, and then use those
+hyperparameters for training a final model effectively used for the data compression
+
+Optuna is used for hyperparameter optimizaton
+Dropout and L2 regularization are used
+Residual connections are implemented for gradient descents
+
+"""
+
+import optuna
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+import pandas as pd
+import numpy as np
+
+#### Preprocessing data ####
+
+'''
+The final databases have the following column informations:
+    FA: ID (a number indexing the D/A pairs), Nickname (of the donor molecule), Reference, PCE_max(%),
+      PCE_ave(%), Voc(V), Jsc(mA/cm2), FF, Mw(kg/mol), Mn(kg/mol), PDI(=Mw/Mn), Monomer(g/m),
+      -HOMO_p(eV), -LUMO_p(eV), Eg_p(eV), p(CDK Fingerprint), p(RDKit Fingerprint), p(Morgan Fingerprint)
+      -HOMO_n(eV), -LUMO_n(eV), Eg_n(eV), n(RDKit Fingerprint), n(Morgan Fingerprint), n(CDK Fingerprint)
+
+    NFA: ID, Ref, PCE_max(%), PCE_ave(%), Jsc(mA/cm2), FF, Voc(V),
+       -HOMO_n(eV), -LUMO_n(eV), Eg_n(eV), n(SMILES), M(g/mol),
+       -HOMO_p(eV), -LUMO_p(eV), Eg_p(eV), p(SMILES), Mw(kg/mol),
+       Mn(kg/mol), PDI, n(CDK Fingerprint), n(RDKit Fingerprint),
+       n(Morgan Fingerprint), p(CDK Fingerprint), p(RDKit Fingerprint),
+       p(Morgan Fingerprint)
+'''
+
+def is_binary(fp):
+    return isinstance(fp, str) and all(char in '01' for char in fp)
+
+df1 = pd.read_csv('final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+df1 = df1[df1[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
+df1['CDK_fp'] = df1['n(CDK Fingerprint)'] + df1['p(CDK Fingerprint)']
+df1['RDKit_fp'] = df1['n(RDKit Fingerprint)'] + df1['p(RDKit Fingerprint)']
+df1['Morgan_fp'] = df1['n(Morgan Fingerprint)'] + df1['p(Morgan Fingerprint)']
+df1 = df1[['CDK_fp', 'RDKit_fp', 'Morgan_fp', 'PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']].reset_index(drop=True)
+
+df2 = pd.read_csv('final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+df2 = df2[df2[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
+df2['CDK_fp']    = df2['n(CDK Fingerprint)'] + df2['p(CDK Fingerprint)']
+df2['RDKit_fp']  = df2['n(RDKit Fingerprint)'] + df2['p(RDKit Fingerprint)']
+df2['Morgan_fp'] = df2['n(Morgan Fingerprint)'] + df2['p(Morgan Fingerprint)']
+df2 = df2[['CDK_fp', 'RDKit_fp', 'Morgan_fp', 'PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']].reset_index(drop=True)
+
+df = pd.concat([df1, df2], ignore_index=True)
+df = df.sample(frac=1).reset_index(drop=True)
+
+X = df['Morgan_fp']
+
+def convert_to_binary_vector(fp_str):
+    return [int(bit) for bit in fp_str]
+
+# Convert fingerprints to binary vectors
+try:
+    binary_vectors = np.array([convert_to_binary_vector(fp) for fp in X.values])
+except ValueError as e:
+    print(e)
+
+# Split data (use the binary_vectors array for splitting)
+X_train_val, X_test = train_test_split(binary_vectors, test_size=0.2, random_state=42)
+X_train, X_val = train_test_split(X_train_val, test_size=0.2, random_state=42)
+
+# Define the device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Convert to PyTorch tensors and move to GPU (if available)
+X_train_val_tensor = torch.tensor(X_train_val, dtype=torch.float32).to(device)
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
+X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+
+print(f"Training on: {device}")
+
+# Define the autoencoder with dropout rate as a hyperparameter
+class FingerprintAutoencoder(nn.Module):
+    def __init__(self, input_dim, embedding_dim, dropout_rate):
+        super(FingerprintAutoencoder, self).__init__()
+        # Encoder layers
+        self.encoder_fc1 = nn.Linear(input_dim, 512)
+        self.encoder_bn1 = nn.BatchNorm1d(512)
+        self.encoder_dropout1 = nn.Dropout(dropout_rate)
+        
+        self.encoder_fc2 = nn.Linear(512, 256)
+        self.encoder_bn2 = nn.BatchNorm1d(256)
+        self.encoder_dropout2 = nn.Dropout(dropout_rate)
+        
+        self.encoder_fc3 = nn.Linear(256, 128)
+        self.encoder_bn3 = nn.BatchNorm1d(128)
+        self.encoder_dropout3 = nn.Dropout(dropout_rate)
+        
+        self.encoder_fc4 = nn.Linear(128, embedding_dim)
+        
+        # Decoder layers
+        self.decoder_fc1 = nn.Linear(embedding_dim, 128)
+        self.decoder_bn1 = nn.BatchNorm1d(128)
+        self.decoder_dropout1 = nn.Dropout(dropout_rate)
+        
+        self.decoder_fc2 = nn.Linear(128, 256)
+        self.decoder_bn2 = nn.BatchNorm1d(256)
+        self.decoder_dropout2 = nn.Dropout(dropout_rate)
+        
+        self.decoder_fc3 = nn.Linear(256, 512)
+        self.decoder_bn3 = nn.BatchNorm1d(512)
+        self.decoder_dropout3 = nn.Dropout(dropout_rate)
+        
+        self.decoder_fc4 = nn.Linear(512, input_dim)
+
+    def encode(self, x):
+        residual = self.encoder_fc1(x)
+        x = torch.relu(self.encoder_bn1(self.encoder_fc1(x)))
+        x = self.encoder_dropout1(x)
+        x = x + residual
+
+        residual = self.encoder_fc2(x)
+        x = torch.relu(self.encoder_bn2(self.encoder_fc2(x)))
+        x = self.encoder_dropout2(x)
+        x = x + residual
+
+        residual = self.encoder_fc3(x)
+        x = torch.relu(self.encoder_bn3(self.encoder_fc3(x)))
+        x = self.encoder_dropout3(x)
+        x = x + residual
+
+        encoded = torch.relu(self.encoder_fc4(x))
+        return encoded
+
+    def decode(self, encoded):
+        residual = self.decoder_fc1(encoded)
+        x = torch.relu(self.decoder_bn1(self.decoder_fc1(encoded)))
+        x = self.decoder_dropout1(x)
+        x = x + residual
+
+        residual = self.decoder_fc2(x)
+        x = torch.relu(self.decoder_bn2(self.decoder_fc2(x)))
+        x = self.decoder_dropout2(x)
+        x = x + residual
+
+        residual = self.decoder_fc3(x)
+        x = torch.relu(self.decoder_bn3(self.decoder_fc3(x)))
+        x = self.decoder_dropout3(x)
+        x = x + residual
+
+        decoded = torch.sigmoid(self.decoder_fc4(x))
+        return decoded
+
+    def forward(self, x):
+        encoded = self.encode(x)
+        decoded = self.decode(encoded)
+        return encoded, decoded
+
+embedding_dim = 32
+epochs = 100
+
+# Optuna objective function
+def objective(trial):
+    # Hyperparameters to tune
+    dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.9)  # Dropout rate
+    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)  # Learning rate
+    weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)  # Weight decay
+
+    # Model
+    model = FingerprintAutoencoder(input_dim=X_train_tensor.shape[1], embedding_dim=embedding_dim, dropout_rate=dropout_rate).to(device)
+    
+    # Optimizer and loss function
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)  # Include weight_decay
+    criterion = nn.BCELoss()
+
+    # Training loop
+    model.train()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        _, reconstructed = model(X_train_tensor)
+        loss = criterion(reconstructed, X_train_tensor)
+        loss.backward()
+        optimizer.step()
+
+    # Evaluate the model on validation set
+    model.eval()
+    with torch.no_grad():
+        _, reconstructed = model(X_val_tensor)
+        val_loss = criterion(reconstructed, X_val_tensor)
+
+    return val_loss.item()
+
+# Create Optuna study
+study = optuna.create_study(direction='minimize')
+# Run the optimization
+study.optimize(objective, n_trials=200)
+
+# Print the best hyperparameters
+print('Best trial:')
+trial = study.best_trial
+print(f'Loss: {trial.value}')
+best_params = study.best_trial.params
+print("Best hyperparameters found by Optuna:")
+print(best_params)
+
+# Best hyperparameters
+best_dropout_rate = best_params['dropout_rate']
+best_learning_rate = best_params['learning_rate']
+best_weight_decay = best_params['weight_decay']
+
+# Initialize the model with the best hyperparameters
+final_model = FingerprintAutoencoder(input_dim=X_train_tensor.shape[1], embedding_dim=embedding_dim, dropout_rate=best_dropout_rate).to(device)
+
+# Optimizer and loss function with the best hyperparameters
+final_optimizer = optim.Adam(final_model.parameters(), lr=best_learning_rate, weight_decay=best_weight_decay)
+criterion = nn.BCELoss()
+
+# Final training loop
+final_model.train()
+for epoch in range(epochs):
+    final_optimizer.zero_grad()
+    _, reconstructed = final_model(X_train_val_tensor)
+    loss = criterion(reconstructed, X_train_val_tensor)
+    loss.backward()
+    final_optimizer.step()
+
+    if (epoch + 1) % 10 == 0:
+        print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}')
+
+# Evaluate on the test set
+final_model.eval()
+with torch.no_grad():
+    _, test_reconstructed = final_model(X_test_tensor)
+    test_loss = criterion(test_reconstructed, X_test_tensor)
+
+print(f'Test Loss: {test_loss.item():.4f}')
+
+#### Compressing the Data ####
+
+X_tensor = torch.tensor(np.array([convert_to_binary_vector(fp) for fp in X.values]), dtype=torch.float32).to(device)
+
+# Get the encoded representation using the loaded encoder
+with torch.no_grad():
+    encoded_data = final_model.encode(X_tensor)
+
+# Convert encoded data to numpy array and create DataFrame
+encoded_df = pd.DataFrame(encoded_data.cpu().numpy())
+
+# Concatenate the encoded DataFrame with the original DataFrame X
+combined_df = pd.concat([X, encoded_df], axis=1)
+combined_df.to_csv('combined_data.csv', index=False)
+
+#### Saving the model ####
+
+# Save the entire autoencoder model
+torch.save(final_model.state_dict(), 'autoencoder_model.pth')
+
+# Save encoder and decoder parts by accessing their layers directly
+encoder_state_dict = {
+    'encoder_fc1': final_model.encoder_fc1.state_dict(),
+    'encoder_bn1': final_model.encoder_bn1.state_dict(),
+    'encoder_fc2': final_model.encoder_fc2.state_dict(),
+    'encoder_bn2': final_model.encoder_bn2.state_dict(),
+    'encoder_fc3': final_model.encoder_fc3.state_dict(),
+    'encoder_bn3': final_model.encoder_bn3.state_dict(),
+    'encoder_fc4': final_model.encoder_fc4.state_dict(),
+}
+
+decoder_state_dict = {
+    'decoder_fc1': final_model.decoder_fc1.state_dict(),
+    'decoder_bn1': final_model.decoder_bn1.state_dict(),
+    'decoder_fc2': final_model.decoder_fc2.state_dict(),
+    'decoder_bn2': final_model.decoder_bn2.state_dict(),
+    'decoder_fc3': final_model.decoder_fc3.state_dict(),
+    'decoder_bn3': final_model.decoder_bn3.state_dict(),
+    'decoder_fc4': final_model.decoder_fc4.state_dict(),
+}
+
+torch.save(encoder_state_dict, 'encoder.pth')
+torch.save(decoder_state_dict, 'decoder.pth')
+
+#### Loading a model previously saved ####
+
+'''
+model = FingerprintAutoencoder(input_dim, embedding_dim, dropout_rate)
+model.load_state_dict(torch.load('autoencoder_model.pth'))
+
+# Load the encoder and decoder weights back into the model
+model.encoder_fc1.load_state_dict(torch.load('encoder.pth')['encoder_fc1'])
+model.encoder_bn1.load_state_dict(torch.load('encoder.pth')['encoder_bn1'])
+model.encoder_fc2.load_state_dict(torch.load('encoder.pth')['encoder_fc2'])
+model.encoder_bn2.load_state_dict(torch.load('encoder.pth')['encoder_bn2'])
+model.encoder_fc3.load_state_dict(torch.load('encoder.pth')['encoder_fc3'])
+model.encoder_bn3.load_state_dict(torch.load('encoder.pth')['encoder_bn3'])
+model.encoder_fc4.load_state_dict(torch.load('encoder.pth')['encoder_fc4'])
+
+model.decoder_fc1.load_state_dict(torch.load('decoder.pth')['decoder_fc1'])
+model.decoder_bn1.load_state_dict(torch.load('decoder.pth')['decoder_bn1'])
+model.decoder_fc2.load_state_dict(torch.load('decoder.pth')['decoder_fc2'])
+model.decoder_bn2.load_state_dict(torch.load('decoder.pth')['decoder_bn2'])
+model.decoder_fc3.load_state_dict(torch.load('decoder.pth')['decoder_fc3'])
+model.decoder_bn3.load_state_dict(torch.load('decoder.pth')['decoder_bn3'])
+model.decoder_fc4.load_state_dict(torch.load('decoder.pth')['decoder_fc4'])
+'''
