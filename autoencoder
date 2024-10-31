@@ -8,7 +8,8 @@ hyperparameters for training a final model effectively used for the data compres
 
 Optuna is used for hyperparameter optimizaton
 Dropout and L2 regularization are used
-Residual connections are implemented for gradient descents
+Residual connections and Batch Norm layers are implemented for favoring the flow of gradients
+Adam optimizer was used for gradient descent
 
 """
 
