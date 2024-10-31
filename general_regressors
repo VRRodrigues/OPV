@@ -1,0 +1,1239 @@
+# -*- coding: utf-8 -*-
+"""
+@author: vicre
+
+This code is train and optimize the hyperparameters of the following regression models:
+  - Support Vector Regressor (SVR)
+  - k-NN Regressor (k-NN)
+  - Kernel Ridge Regressor (KRR)
+
+The context considered are:
+  - Trainig of models only considering fingerprints
+  - Trainig of models only considering the other descriptors, ignoring fingerprints
+  - Trainig of models only considering the other descriptors and the fingerprints
+
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.svm import SVR
+from sklearn.metrics import mean_squared_error
+from scipy.stats import pearsonr
+from scipy.spatial.distance import pdist, squareform
+from sklearn.metrics.pairwise import pairwise_kernels
+import optuna
+from sklearn.model_selection import KFold, cross_val_score
+
+#### Data Prepocessing ####
+
+df1 = pd.read_csv('final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+df1 = df1.rename(columns={'PDI(=Mw/Mn)': 'PDI', 'Monomer(g/m)':'M(g/mol)'})
+df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].replace('-', np.nan)
+df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].apply(pd.to_numeric, errors='coerce')
+df1= df1.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
+df1 = df1.dropna()
+
+df2 = pd.read_csv('final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+df2 = df2.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
+df2 = df2.dropna()
+
+df = pd.concat([df1, df2], ignore_index=True)
+
+X = df[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']]
+y = df[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+X_1 = df1[['M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']]
+y_1 = df1[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+X_2 = df2[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']]
+y_2 = df2[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+
+# Splitting the data into a training and a test st
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train_1, X_test_1, y_train_1, y_test_1 = train_test_split(X_1, y_1, test_size=0.2, random_state=42)
+X_train_2, X_test_2, y_train_2, y_test_2 = train_test_split(X_2, y_2, test_size=0.2, random_state=42)
+
+# Scaling of the data
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+scaler_1 = StandardScaler()
+X_train_scaled_1 = scaler_1.fit_transform(X_train_1)
+X_test_scaled_1 = scaler_1.transform(X_test_1)
+
+scaler_2 = StandardScaler()
+X_train_scaled_2 = scaler_2.fit_transform(X_train_2)
+X_test_scaled_2 = scaler_2.transform(X_test_2)
+
+def evaluate_model(model, X_test, y_test):
+    '''
+    This function is used for the evaluation of model on a test set
+    '''
+
+    y_pred = model.predict(X_test)
+    if len(y_pred.shape) == 2 and y_pred.shape[1] == 1:
+        y_pred = y_pred.ravel()
+    if len(y_test.shape) == 2 and y_test.shape[1] == 1:
+        y_test = y_test.values.ravel()
+    
+    mse = mean_squared_error(y_test, y_pred)
+    pearson_corr, _ = pearsonr(y_test, y_pred)
+    print(f'Test MSE: {mse:.4f}')
+    print(f'Pearson Correlation Coefficient: {pearson_corr:.4f}')
+
+    return mse, pearson_corr
+
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# ===============================
+# Not considering fingerprints
+# ===============================
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+print ("Not considering fingerprints\n")
+
+def train_models(X_train, y_train, X_test, y_test):
+    '''
+    This function find the best hyperparameters for each of the considered regression models.
+    A final model is then trained in the training set with the best hyperparameters and it is then evaluated.
+    Grid-search 5-fold cross validation is used for optimization of the hyperparameters.
+    '''
+
+    knn_params = {
+        'n_neighbors': [3,5,7,9,11,13,15],
+        'weights': ['uniform', 'distance'],
+        'p': [1, 2]  # 1: Manhattan, 2: Euclidean distance
+        }
+
+    krr_params = {
+        'alpha': [0.01, 0.1, 1.0, 10],
+        'kernel': ['linear', 'poly', 'rbf', 'sigmoid'],
+        'degree': [2, 3, 4]  # Only applicable if 'poly' kernel is used
+        }
+
+    svr_params = {
+        'C': [0.1, 1, 10, 100],
+        'epsilon': [0.01, 0.1, 1],
+        'kernel': ['linear', 'poly', 'rbf', 'sigmoid'],
+        'degree': [2, 3, 4]  # Only applicable if 'poly' kernel is used
+        }
+
+    knn = KNeighborsRegressor()
+    krr = KernelRidge()
+    svr = SVR()
+
+    knn_search = GridSearchCV(knn, knn_params, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+    krr_search = GridSearchCV(krr, krr_params, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+    svr_search = GridSearchCV(svr, svr_params, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+
+    knn_search.fit(X_train, y_train)
+    krr_search.fit(X_train, y_train)
+    svr_search.fit(X_train, y_train)
+
+    print("Best k-NN parameters:", knn_search.best_params_)
+    evaluate_model(knn_search.best_estimator_, X_test, y_test)
+    print("Best Kernel Ridge parameters:", krr_search.best_params_)
+    evaluate_model(krr_search.best_estimator_, X_test, y_test)    
+    print("Best SVR parameters:", svr_search.best_params_)
+    evaluate_model(svr_search.best_estimator_, X_test, y_test)
+    
+    return knn_search.best_estimator_, krr_search.best_estimator_, svr_search.best_estimator_
+
+print("\nResults FA\n")
+print ("Prediction of PCE")
+knn_pce, krr_pce, svr_pce = train_models(X_train_scaled_1, y_train_1['PCE_ave(%)'], X_test_scaled_1, y_test_1['PCE_ave(%)'])
+print ("Prediction of Jsc")
+knn_jsc, krr_jsc, svr_jsc =train_models(X_train_scaled_1, y_train_1['Jsc(mA/cm2)'], X_test_scaled_1, y_test_1['Jsc(mA/cm2)'])
+print ("Prediction of FF")
+knn_ff, krr_ff, svr_ff =train_models(X_train_scaled_1, y_train_1['FF'], X_test_scaled_1, y_test_1['FF'])
+print ("Prediction of Voc")
+knn_voc, krr_voc, svr_voc =train_models(X_train_scaled_1, y_train_1['Voc(V)'], X_test_scaled_1, y_test_1['Voc(V)'])
+
+print("\nResults NFA\n")
+print ("Prediction of PCE")
+knn_pce, krr_pce, svr_pce = train_models(X_train_scaled_2, y_train_2['PCE_ave(%)'], X_test_scaled_2, y_test_2['PCE_ave(%)'])
+print ("Prediction of Jsc")
+knn_jsc, krr_jsc, svr_jsc =train_models(X_train_scaled_2, y_train_2['Jsc(mA/cm2)'], X_test_scaled_2, y_test_2['Jsc(mA/cm2)'])
+print ("Prediction of FF")
+knn_ff, krr_ff, svr_ff =train_models(X_train_scaled_2, y_train_2['FF'], X_test_scaled_2, y_test_2['FF'])
+print ("Prediction of Voc")
+knn_voc, krr_voc, svr_voc =train_models(X_train_scaled_2, y_train_2['Voc(V)'], X_test_scaled_2, y_test_2['Voc(V)'])
+
+print("\nResults FA+NFA\n")
+print ("Prediction of PCE")
+knn_pce, krr_pce, svr_pce = train_models(X_train_scaled, y_train['PCE_ave(%)'], X_test_scaled, y_test['PCE_ave(%)'])
+print ("Prediction of Jsc")
+knn_jsc, krr_jsc, svr_jsc =train_models(X_train_scaled, y_train['Jsc(mA/cm2)'], X_test_scaled, y_test['Jsc(mA/cm2)'])
+print ("Prediction of FF")
+knn_ff, krr_ff, svr_ff =train_models(X_train_scaled, y_train['FF'], X_test_scaled, y_test['FF'])
+print ("Prediction of Voc")
+knn_voc, krr_voc, svr_voc =train_models(X_train_scaled, y_train['Voc(V)'], X_test_scaled, y_test['Voc(V)'])
+
+
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# =================================
+# Only considering fingerprints
+# =================================
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+print("\nConsidering Only fingerprints\n")
+
+#### Data Preprocessins ####
+
+def is_binary(fp):
+    return isinstance(fp, str) and all(char in '01' for char in fp)
+
+df1 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\FA_Polymer\final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+df1 = df1[df1[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
+df1['CDK_fp']    = df1['n(CDK Fingerprint)'] + df1['p(CDK Fingerprint)']
+df1['RDKit_fp']  = df1['n(RDKit Fingerprint)'] + df1['p(RDKit Fingerprint)']
+df1['Morgan_fp'] = df1['n(Morgan Fingerprint)'] + df1['p(Morgan Fingerprint)']
+df1 = df1[['CDK_fp', 'RDKit_fp', 'Morgan_fp', 'PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']].reset_index(drop=True)
+
+df2 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\NFA_Polymer\final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+df2 = df2[df2[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
+df2['CDK_fp']    = df2['n(CDK Fingerprint)'] + df2['p(CDK Fingerprint)']
+df2['RDKit_fp']  = df2['n(RDKit Fingerprint)'] + df2['p(RDKit Fingerprint)']
+df2['Morgan_fp'] = df2['n(Morgan Fingerprint)'] + df2['p(Morgan Fingerprint)']
+df2 = df2[['CDK_fp', 'RDKit_fp', 'Morgan_fp', 'PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']].reset_index(drop=True)
+
+df = pd.concat([df1, df2], ignore_index=True)
+
+X = df[['CDK_fp', 'RDKit_fp', 'Morgan_fp']]
+X1 = df1[['CDK_fp', 'RDKit_fp', 'Morgan_fp']]
+X2 = df2[['CDK_fp', 'RDKit_fp', 'Morgan_fp']]
+y = df[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+y1 = df1[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+y2 = df2[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+
+fp_train, fp_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+fp_train_1, fp_test_1, y_train_1, y_test_1 = train_test_split(X1, y1, test_size=0.2, random_state=42)
+fp_train_2, fp_test_2, y_train_2, y_test_2 = train_test_split(X2, y2, test_size=0.2, random_state=42)
+
+def convert_to_binary_vector(fp_str):
+    return [int(bit) for bit in fp_str]
+
+# Conversion of fingerprints' strings into binary vectors
+try:
+    train_binary_vectors_mor = np.array([convert_to_binary_vector(fp) for fp in fp_train['Morgan_fp']])
+    train_binary_vectors_cdk = np.array([convert_to_binary_vector(fp) for fp in fp_train['CDK_fp']])
+    train_binary_vectors_rdk = np.array([convert_to_binary_vector(fp) for fp in fp_train['RDKit_fp']])
+    
+    train_binary_vectors_mor_1 = np.array([convert_to_binary_vector(fp) for fp in fp_train_1['Morgan_fp']])
+    train_binary_vectors_cdk_1 = np.array([convert_to_binary_vector(fp) for fp in fp_train_1['CDK_fp']])
+    train_binary_vectors_rdk_1 = np.array([convert_to_binary_vector(fp) for fp in fp_train_1['RDKit_fp']])
+    
+    train_binary_vectors_mor_2 = np.array([convert_to_binary_vector(fp) for fp in fp_train_2['Morgan_fp']])
+    train_binary_vectors_cdk_2 = np.array([convert_to_binary_vector(fp) for fp in fp_train_2['CDK_fp']])
+    train_binary_vectors_rdk_2 = np.array([convert_to_binary_vector(fp) for fp in fp_train_2['RDKit_fp']] )  
+except ValueError as e:
+    print(e)
+    
+try:
+    test_binary_vectors_mor = np.array([convert_to_binary_vector(fp) for fp in fp_test['Morgan_fp']])
+    test_binary_vectors_cdk = np.array([convert_to_binary_vector(fp) for fp in fp_test['CDK_fp']])
+    test_binary_vectors_rdk = np.array([convert_to_binary_vector(fp) for fp in fp_test['RDKit_fp']])
+    
+    test_binary_vectors_mor_1 = np.array([convert_to_binary_vector(fp) for fp in fp_test_1['Morgan_fp']])
+    test_binary_vectors_cdk_1 = np.array([convert_to_binary_vector(fp) for fp in fp_test_1['CDK_fp']])
+    test_binary_vectors_rdk_1 = np.array([convert_to_binary_vector(fp) for fp in fp_test_1['RDKit_fp']])
+
+    test_binary_vectors_mor_2 = np.array([convert_to_binary_vector(fp) for fp in fp_test_2['Morgan_fp']])
+    test_binary_vectors_cdk_2 = np.array([convert_to_binary_vector(fp) for fp in fp_test_2['CDK_fp']])
+    test_binary_vectors_rdk_2 = np.array([convert_to_binary_vector(fp) for fp in fp_test_2['RDKit_fp']])
+except ValueError as e:
+    print(e)
+
+def tanimoto_coeff(x, y):
+    '''
+    This function calculates the Tanimoto Similarity Index between two fingerprints specified by numpy arrays x and y
+    '''
+
+    intersection = np.sum(np.logical_and(x, y))
+    union = np.sum(x) + np.sum(y) - intersection
+    return 0.0 if union == 0 else 1 - intersection / union
+
+def tanimoto_coeff_matrix(X, Y):
+    '''
+    This function returns a matrix whose elements ij are the tanimoto distances of the i-th fingerprint in X and the j-the fingerprint in Y
+    '''
+
+    intersection = np.dot(X, Y.T)
+    union = np.sum(X, axis=1)[:, None] + np.sum(Y, axis=1) - intersection
+    return 1 - (intersection / union)
+
+
+""" k-NN """
+
+
+def train_kNN(binary_vectors_morgan, binary_vectors_cdk, binary_vectors_rdkit, target_values, test_binary_vectors_morgan, test_binary_vectors_cdk, test_binary_vectors_rdkit, y_test):
+    '''
+    This function finds the best hyperparameters for a k-NN Regressor.
+    A final model is then trained in the training set with the best hyperparameters and it is then evaluated.
+    Grid-search 5-fold cross validation is used for optimization of the hyperparameters.
+    '''
+
+    knn_mor = KNeighborsRegressor(metric='precomputed')
+    knn_cdk = KNeighborsRegressor(metric='precomputed')
+    knn_rdk = KNeighborsRegressor(metric='precomputed')
+
+    param_grid = {'n_neighbors': [3,5,7,9,11,13,15],
+                  'weights': ['uniform', 'distance']}
+    
+    distance_matrix_mor = tanimoto_coeff_matrix(binary_vectors_morgan, binary_vectors_morgan)
+    distance_matrix_cdk = tanimoto_coeff_matrix(binary_vectors_cdk, binary_vectors_cdk)
+    distance_matrix_rdk = tanimoto_coeff_matrix(binary_vectors_rdkit, binary_vectors_rdkit)
+    
+    distance_matrix_mor_test = tanimoto_coeff_matrix(test_binary_vectors_morgan, binary_vectors_morgan)
+    distance_matrix_cdk_test = tanimoto_coeff_matrix(test_binary_vectors_cdk, binary_vectors_cdk)
+    distance_matrix_rdk_test = tanimoto_coeff_matrix(test_binary_vectors_rdkit, binary_vectors_rdkit)
+    
+    grid_search_mor = GridSearchCV(knn_mor, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+    grid_search_cdk = GridSearchCV(knn_cdk, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+    grid_search_rdk = GridSearchCV(knn_rdk, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+
+    grid_search_mor.fit(distance_matrix_mor, target_values)
+    grid_search_cdk.fit(distance_matrix_cdk, target_values)
+    grid_search_rdk.fit(distance_matrix_rdk, target_values)
+
+    print(f"k-NN: Best Parameters for Morgan: {grid_search_mor.best_params_}")
+    best_knn_mor = grid_search_mor.best_estimator_
+    evaluate_model(best_knn_mor, distance_matrix_mor_test, y_test)
+    print(f"k-NN: Best Parameters for CDK: {grid_search_cdk.best_params_}")
+    best_knn_cdk = grid_search_cdk.best_estimator_
+    evaluate_model(best_knn_cdk, distance_matrix_cdk_test, y_test)
+    print(f"k-NN: Best Parameters for RDKit: {grid_search_rdk.best_params_}")
+    best_knn_rdk = grid_search_rdk.best_estimator_
+    evaluate_model(best_knn_rdk, distance_matrix_rdk_test, y_test)
+    
+    return best_knn_mor, best_knn_cdk, best_knn_rdk
+
+print("\nResults FA\n")
+print("Prediction of PCE with kNN")
+best_knn_mor_pce, best_knn_cdk_pce, best_knn_rdk_pce = train_kNN(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                                 target_values = y_train_1['PCE_ave(%)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                                 y_test = y_test_1['PCE_ave(%)'])
+print("Prediction of Jsc with kNN")
+best_knn_mor_jsc, best_knn_cdk_jsc, best_knn_rdk_jsc = train_kNN(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                                 target_values = y_train_1['Jsc(mA/cm2)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                                 y_test = y_test_1['Jsc(mA/cm2)'])
+print("Prediction of FF with kNN")
+best_knn_mor_ff, best_knn_cdk_ff, best_knn_rdk_ff = train_kNN(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                              binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                              binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                              target_values = y_train_1['FF'], 
+                                                              test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                              test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                              test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                              y_test = y_test_1['FF'])
+print("Prediction of Voc with kNN")
+best_knn_mor_voc, best_knn_cdk_voc, best_knn_rdk_voc = train_kNN(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                                 target_values = y_train_1['Voc(V)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                                 y_test = y_test_1['Voc(V)'])
+
+print("\nResults NFA\n")
+print("Prediction of PCE with kNN")
+best_knn_mor_pce, best_knn_cdk_pce, best_knn_rdk_pce = train_kNN(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                                 target_values = y_train_2['PCE_ave(%)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                                 y_test = y_test_2['PCE_ave(%)'])
+print("Prediction of Jsc with kNN")
+best_knn_mor_jsc, best_knn_cdk_jsc, best_knn_rdk_jsc = train_kNN(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                                 target_values = y_train_2['Jsc(mA/cm2)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                                 y_test = y_test_2['Jsc(mA/cm2)'])
+print("Prediction of FF with kNN")
+best_knn_mor_ff, best_knn_cdk_ff, best_knn_rdk_ff = train_kNN(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                              binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                              binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                              target_values = y_train_2['FF'], 
+                                                              test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                              test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                              test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                              y_test = y_test_2['FF'])
+print("Prediction of Voc with kNN")
+best_knn_mor_voc, best_knn_cdk_voc, best_knn_rdk_voc = train_kNN(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                                 target_values = y_train_2['Voc(V)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                                 y_test = y_test_2['Voc(V)'])
+
+print("\nResults FA+NFA\n")
+print("Prediction of PCE with kNN")
+best_knn_mor_pce, best_knn_cdk_pce, best_knn_rdk_pce = train_kNN(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['PCE_ave(%)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['PCE_ave(%)'])
+print("Prediction of Jsc with kNN")
+best_knn_mor_jsc, best_knn_cdk_jsc, best_knn_rdk_jsc = train_kNN(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['Jsc(mA/cm2)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['Jsc(mA/cm2)'])
+print("Prediction of FF with kNN")
+best_knn_mor_ff, best_knn_cdk_ff, best_knn_rdk_ff = train_kNN(binary_vectors_morgan = train_binary_vectors_mor,
+                                                              binary_vectors_cdk = train_binary_vectors_cdk,
+                                                              binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                              target_values = y_train['FF'], 
+                                                              test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                              test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                              test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                              y_test = y_test['FF'])
+print("Prediction of Voc with kNN")
+best_knn_mor_voc, best_knn_cdk_voc, best_knn_rdk_voc = train_kNN(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['Voc(V)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['Voc(V)'])
+
+
+""" SVR """
+
+def train_svr(binary_vectors_morgan, binary_vectors_cdk, binary_vectors_rdkit, target_values, test_binary_vectors_morgan, test_binary_vectors_cdk, test_binary_vectors_rdkit, y_test):
+    '''
+    This function finds the best hyperparameters for a Support Vector Regressor.
+    A final model is then trained in the training set with the best hyperparameters and it is then evaluated.
+    Grid-search 5-fold cross validation is used for optimization of the hyperparameters.
+    '''
+
+    svr_mor = SVR(kernel='precomputed')
+    svr_cdk = SVR(kernel='precomputed')
+    svr_rdk = SVR(kernel='precomputed')
+    
+    kernel_matrix_mor = tanimoto_coeff_matrix(binary_vectors_morgan, binary_vectors_morgan)
+    kernel_matrix_cdk = tanimoto_coeff_matrix(binary_vectors_cdk, binary_vectors_cdk)
+    kernel_matrix_rdk = tanimoto_coeff_matrix(binary_vectors_rdkit, binary_vectors_rdkit)
+    
+    kernel_matrix_mor_test = tanimoto_coeff_matrix(test_binary_vectors_morgan, binary_vectors_morgan)
+    kernel_matrix_cdk_test = tanimoto_coeff_matrix(test_binary_vectors_cdk, binary_vectors_cdk)
+    kernel_matrix_rdk_test = tanimoto_coeff_matrix(test_binary_vectors_rdkit, binary_vectors_rdkit)
+
+    param_grid = {'C': [0.1, 1, 10, 100], 'epsilon': [0.01, 0.1, 1]}
+
+    grid_search_mor = GridSearchCV(svr_mor, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=2)
+    grid_search_cdk = GridSearchCV(svr_cdk, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=2)
+    grid_search_rdk = GridSearchCV(svr_rdk, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=2)
+
+    grid_search_mor.fit(kernel_matrix_mor, target_values)
+    grid_search_cdk.fit(kernel_matrix_cdk, target_values)
+    grid_search_rdk.fit(kernel_matrix_rdk, target_values)
+
+    print(f"SVR: Best Parameters for Morgan: {grid_search_mor.best_params_}")
+    best_svr_mor = grid_search_mor.best_estimator_
+    evaluate_model(best_svr_mor, kernel_matrix_mor_test, y_test)
+    print(f"SVR: Best Parameters for CDK: {grid_search_cdk.best_params_}")
+    best_svr_cdk = grid_search_cdk.best_estimator_
+    evaluate_model(best_svr_cdk, kernel_matrix_cdk_test, y_test)
+    print(f"SVR: Best Parameters for RDKit: {grid_search_rdk.best_params_}")
+    best_svr_rdk = grid_search_rdk.best_estimator_
+    evaluate_model(best_svr_rdk, kernel_matrix_rdk_test, y_test)
+    
+    return best_svr_mor, best_svr_cdk, best_svr_rdk
+
+print("\nResults FA\n")
+print("Prediction of PCE with SVR")
+best_svr_mor_pce, best_svr_cdk_pce, best_svr_rdk_pce = train_svr(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                                 target_values = y_train_1['PCE_ave(%)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                                 y_test = y_test_1['PCE_ave(%)'])
+print("Prediction of Jsc with SVR")
+best_svr_mor_jsc, best_svr_cdk_jsc, best_svr_rdk_jsc = train_svr(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                                 target_values = y_train_1['Jsc(mA/cm2)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                                 y_test = y_test_1['Jsc(mA/cm2)'])
+print("Prediction of FF with SVR")
+best_svr_mor_ff, best_svr_cdk_ff, best_svr_rdk_ff = train_svr(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                              binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                              binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                              target_values = y_train_1['FF'], 
+                                                              test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                              test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                              test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                              y_test = y_test_1['FF'])
+print("Prediction of Voc with SVR")
+best_svr_mor_voc, best_svr_cdk_voc, best_svr_rdk_voc = train_svr(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                                 target_values = y_train_1['Voc(V)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                                 y_test = y_test_1['Voc(V)'])
+
+print("\nResults NFA\n")
+print("Prediction of PCE with SVR")
+best_svr_mor_pce, best_svr_cdk_pce, best_svr_rdk_pce = train_svr(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                                 target_values = y_train_2['PCE_ave(%)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                                 y_test = y_test_2['PCE_ave(%)'])
+print("Prediction of Jsc with SVR")
+best_svr_mor_jsc, best_svr_cdk_jsc, best_svr_rdk_jsc = train_svr(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                                 target_values = y_train_2['Jsc(mA/cm2)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                                 y_test = y_test_2['Jsc(mA/cm2)'])
+print("Prediction of FF with SVR")
+best_svr_mor_ff, best_svr_cdk_ff, best_svr_rdk_ff = train_svr(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                              binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                              binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                              target_values = y_train_2['FF'], 
+                                                              test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                              test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                              test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                              y_test = y_test_2['FF'])
+print("Prediction of Voc with SVR")
+best_svr_mor_voc, best_svr_cdk_voc, best_svr_rdk_voc = train_svr(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                                 target_values = y_train_2['Voc(V)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                                 y_test = y_test_2['Voc(V)'])
+
+print("\nResults FA+NFA\n")
+print("Prediction of PCE with SVR")
+best_svr_mor_pce, best_svr_cdk_pce, best_svr_rdk_pce = train_svr(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['PCE_ave(%)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['PCE_ave(%)'])
+print("Prediction of Jsc with SVR")
+best_svr_mor_jsc, best_svr_cdk_jsc, best_svr_rdk_jsc = train_svr(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['Jsc(mA/cm2)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['Jsc(mA/cm2)'])
+print("Prediction of FF with SVR")
+best_svr_mor_ff, best_svr_cdk_ff, best_svr_rdk_ff = train_svr(binary_vectors_morgan = train_binary_vectors_mor,
+                                                              binary_vectors_cdk = train_binary_vectors_cdk,
+                                                              binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                              target_values = y_train['FF'], 
+                                                              test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                              test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                              test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                              y_test = y_test['FF'])
+print("Prediction of Voc with SVR")
+best_svr_mor_voc, best_svr_cdk_voc, best_svr_rdk_voc = train_svr(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['Voc(V)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['Voc(V)'])
+
+
+""" KRR """
+
+
+def train_krr(binary_vectors_morgan, binary_vectors_cdk, binary_vectors_rdkit, target_values, test_binary_vectors_morgan, test_binary_vectors_cdk, test_binary_vectors_rdkit, y_test):
+    '''
+    This function finds the best hyperparameter for a Kernel Ridge Regressor.
+    A final model is then trained in the training set with the best hyperparameters and it is then evaluated.
+    Grid-search 5-fold cross validation is used for optimization of the hyperparameters.
+    '''
+
+    krr_mor = KernelRidge(kernel='precomputed')
+    krr_cdk = KernelRidge(kernel='precomputed')
+    krr_rdk = KernelRidge(kernel='precomputed')
+    
+    kernel_matrix_mor = tanimoto_coeff_matrix(binary_vectors_morgan, binary_vectors_morgan)
+    kernel_matrix_cdk = tanimoto_coeff_matrix(binary_vectors_cdk, binary_vectors_cdk)
+    kernel_matrix_rdk = tanimoto_coeff_matrix(binary_vectors_rdkit, binary_vectors_rdkit)
+    
+    kernel_matrix_mor_test = tanimoto_coeff_matrix(test_binary_vectors_morgan, binary_vectors_morgan)
+    kernel_matrix_cdk_test = tanimoto_coeff_matrix(test_binary_vectors_cdk, binary_vectors_cdk)
+    kernel_matrix_rdk_test = tanimoto_coeff_matrix(test_binary_vectors_rdkit, binary_vectors_rdkit)
+
+    param_grid = {'alpha': [0.1, 1, 10, 100]}
+
+    grid_search_mor = GridSearchCV(krr_mor, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+    grid_search_cdk = GridSearchCV(krr_cdk, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+    grid_search_rdk = GridSearchCV(krr_rdk, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+
+    grid_search_mor.fit(kernel_matrix_mor, target_values)
+    grid_search_cdk.fit(kernel_matrix_cdk, target_values)
+    grid_search_rdk.fit(kernel_matrix_rdk, target_values)
+
+    print(f"KRR: Best Parameters for Morgan: {grid_search_mor.best_params_}")
+    best_krr_mor = grid_search_mor.best_estimator_
+    evaluate_model(best_krr_mor, kernel_matrix_mor_test, y_test)
+    print(f"KRR: Best Parameters for CDK: {grid_search_cdk.best_params_}")
+    best_krr_cdk = grid_search_cdk.best_estimator_
+    evaluate_model(best_krr_cdk, kernel_matrix_cdk_test, y_test)
+    print(f"KRR: Best Parameters for RDKit: {grid_search_rdk.best_params_}")
+    best_krr_rdk = grid_search_rdk.best_estimator_
+    evaluate_model(best_krr_rdk, kernel_matrix_rdk_test, y_test)
+    
+    return best_krr_mor, best_krr_cdk, best_krr_rdk
+
+print("\nResults FA\n")
+print("Prediction of PCE with KRR")
+best_krr_mor_pce, best_krr_cdk_pce, best_krr_rdk_pce = train_krr(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                                 target_values = y_train_1['PCE_ave(%)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                                 y_test = y_test_1['PCE_ave(%)'])
+print("Prediction of Jsc with KRR")
+best_krr_mor_jsc, best_krr_cdk_jsc, best_krr_rdk_jsc = train_krr(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                                 target_values = y_train_1['Jsc(mA/cm2)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                                 y_test = y_test_1['Jsc(mA/cm2)'])
+print("Prediction of FF with KRR")
+best_krr_mor_ff, best_krr_cdk_ff, best_krr_rdk_ff = train_krr(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                              binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                              binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                              target_values = y_train_1['FF'], 
+                                                              test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                              test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                              test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                              y_test = y_test_1['FF'])
+print("Prediction of Voc with KRR")
+best_krr_mor_voc, best_krr_cdk_voc, best_krr_rdk_voc = train_krr(binary_vectors_morgan = train_binary_vectors_mor_1,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_1,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_1,
+                                                                 target_values = y_train_1['Voc(V)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_1,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_1,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_1,
+                                                                 y_test = y_test_1['Voc(V)'])
+
+print("\nResults NFA\n")
+print("Prediction of PCE with KRR")
+best_krr_mor_pce, best_krr_cdk_pce, best_krr_rdk_pce = train_krr(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                                 target_values = y_train_2['PCE_ave(%)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                                 y_test = y_test_2['PCE_ave(%)'])
+print("Prediction of Jsc with KRR")
+best_krr_mor_jsc, best_krr_cdk_jsc, best_krr_rdk_jsc = train_krr(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                                 target_values = y_train_2['Jsc(mA/cm2)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                                 y_test = y_test_2['Jsc(mA/cm2)'])
+
+print("Prediction of FF with KRR")
+best_krr_mor_ff, best_krr_cdk_ff, best_krr_rdk_ff = train_krr(binary_vectors_morgan = train_binary_vectors_mor_2,
+                                                              binary_vectors_cdk = train_binary_vectors_cdk_2,
+                                                              binary_vectors_rdkit = train_binary_vectors_rdk_2,
+                                                              target_values = y_train_2['FF'], 
+                                                              test_binary_vectors_morgan = test_binary_vectors_mor_2,
+                                                              test_binary_vectors_cdk = test_binary_vectors_cdk_2,
+                                                              test_binary_vectors_rdkit = test_binary_vectors_rdk_2,
+                                                              y_test = y_test_2['FF'])
+print("Prediction of Voc with KRR")
+best_krr_mor_voc, best_krr_cdk_voc, best_krr_rdk_voc = train_krr(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['Voc(V)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['Voc(V)'])
+
+
+print("\nResults FA+NFA\n")
+print("Prediction of PCE with KRR")
+best_krr_mor_pce, best_krr_cdk_pce, best_krr_rdk_pce = train_krr(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['PCE_ave(%)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['PCE_ave(%)'])
+print("Prediction of Jsc with KRR")
+best_krr_mor_jsc, best_krr_cdk_jsc, best_krr_rdk_jsc = train_krr(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['Jsc(mA/cm2)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['Jsc(mA/cm2)'])
+print("Prediction of FF with KRR")
+best_krr_mor_ff, best_krr_cdk_ff, best_krr_rdk_ff = train_krr(binary_vectors_morgan = train_binary_vectors_mor,
+                                                              binary_vectors_cdk = train_binary_vectors_cdk,
+                                                              binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                              target_values = y_train['FF'], 
+                                                              test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                              test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                              test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                              y_test = y_test['FF'])
+print("Prediction of Voc with KRR")
+best_krr_mor_voc, best_krr_cdk_voc, best_krr_rdk_voc = train_krr(binary_vectors_morgan = train_binary_vectors_mor,
+                                                                 binary_vectors_cdk = train_binary_vectors_cdk,
+                                                                 binary_vectors_rdkit = train_binary_vectors_rdk,
+                                                                 target_values = y_train['Voc(V)'], 
+                                                                 test_binary_vectors_morgan = test_binary_vectors_mor,
+                                                                 test_binary_vectors_cdk = test_binary_vectors_cdk,
+                                                                 test_binary_vectors_rdkit = test_binary_vectors_rdk,
+                                                                 y_test = y_test['Voc(V)'])
+
+
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# =================================
+# Considering all descriptors
+# =================================
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+print("\nConsidering all float descriptors and the best performing fingerprint\n")
+
+#### Data Preprocessing ####
+
+def is_binary(fp):
+    return isinstance(fp, str) and all(char in '01' for char in fp)
+
+def convert_to_binary_vector(fp_str):
+    return [int(bit) for bit in fp_str]
+    
+df1 = pd.read_csv(r'C:\Users\Particular\OPV\final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+df1 = df1.rename(columns={'PDI(=Mw/Mn)': 'PDI', 'Monomer(g/m)':'M(g/mol)'})
+df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].replace('-', np.nan)
+df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].apply(pd.to_numeric, errors='coerce')
+df1 = df1.dropna(subset=['Mn(kg/mol)', 'PDI'])
+df1 = df1[df1[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
+df1 = df1.reset_index(drop=True)
+df1['CDK_fp'] = df1['n(CDK Fingerprint)'] + df1['p(CDK Fingerprint)']
+df1['RDKit_fp'] = df1['n(RDKit Fingerprint)'] + df1['p(RDKit Fingerprint)']
+df1['Morgan_fp'] = df1['n(Morgan Fingerprint)'] + df1['p(Morgan Fingerprint)']
+df1 = df1.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
+df1 = df1.dropna()
+
+df2 = pd.read_csv(r'C:\Users\Particular\OPV\final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+df2 = df2[df2[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
+df2 = df2.reset_index(drop=True)
+df2['CDK_fp'] = df2['n(CDK Fingerprint)'] + df2['p(CDK Fingerprint)']
+df2['RDKit_fp'] = df2['n(RDKit Fingerprint)'] + df2['p(RDKit Fingerprint)']
+df2['Morgan_fp'] = df2['n(Morgan Fingerprint)'] + df2['p(Morgan Fingerprint)']
+df2 = df2.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
+df2 = df2.dropna()
+
+df = pd.concat([df1, df2], ignore_index=True)
+
+X = df[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI', 'CDK_fp', 'RDKit_fp', 'Morgan_fp']]
+y = df[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+X1 = df1[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI', 'CDK_fp', 'RDKit_fp', 'Morgan_fp']]
+y1 = df1[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+X2 = df2[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI', 'CDK_fp', 'RDKit_fp', 'Morgan_fp']]
+y2 = df2[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+
+# Splitting into training and test set
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train_1, X_test_1, y_train_1, y_test_1 = train_test_split(X1, y1, test_size=0.2, random_state=42)
+X_train_2, X_test_2, y_train_2, y_test_2 = train_test_split(X2, y2, test_size=0.2, random_state=42)
+
+# Scaling the data so that it has mean 0 and standard deviation 1
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']])
+X_test_scaled = scaler.transform(X_test[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']])
+X_train_scaled_df = pd.DataFrame(X_train_scaled, columns=['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI'])
+X_test_scaled_df = pd.DataFrame(X_test_scaled, columns=['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI'])
+
+scaler = StandardScaler()
+X_train_scaled_1 = scaler.fit_transform(X_train_1[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']])
+X_test_scaled_1 = scaler.transform(X_test_1[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']])
+X_train_scaled_df_1 = pd.DataFrame(X_train_scaled_1, columns=['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI'])
+X_test_scaled_df_1 = pd.DataFrame(X_test_scaled_1, columns=['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI'])
+
+scaler = StandardScaler()
+X_train_scaled_2 = scaler.fit_transform(X_train_2[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']])
+X_test_scaled_2 = scaler.transform(X_test_2[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']])
+X_train_scaled_df_2 = pd.DataFrame(X_train_scaled_2, columns=['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI'])
+X_test_scaled_df_2 = pd.DataFrame(X_test_scaled_2, columns=['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI'])
+
+used_fingerprint = 'Morgan_fp'
+
+# Converting fingerprints strings into binary vectors
+try:
+    binary_vectors_train = X_train[used_fingerprint].apply(convert_to_binary_vector)
+    binary_vectors_test  = X_test[used_fingerprint].apply(convert_to_binary_vector)
+    
+    binary_vectors_train_1 = X_train_1[used_fingerprint].apply(convert_to_binary_vector)
+    binary_vectors_test_1  = X_test_1[used_fingerprint].apply(convert_to_binary_vector)    
+    
+    binary_vectors_train_2 = X_train_2[used_fingerprint].apply(convert_to_binary_vector)
+    binary_vectors_test_2  = X_test_2[used_fingerprint].apply(convert_to_binary_vector)
+except ValueError as e:
+    print(e)
+    
+# Create a DataFrame from the list of binary vectors
+binary_df_train = pd.DataFrame(binary_vectors_train.tolist(), columns=[f'bit_{i}' for i in range(len(binary_vectors_train.iloc[0]))])
+binary_df_test = pd.DataFrame(binary_vectors_test.tolist(), columns=[f'bit_{i}' for i in range(len(binary_vectors_test.iloc[0]))])
+
+binary_df_train_1 = pd.DataFrame(binary_vectors_train_1.tolist(), columns=[f'bit_{i}' for i in range(len(binary_vectors_train_1.iloc[0]))])
+binary_df_test_1 = pd.DataFrame(binary_vectors_test_1.tolist(), columns=[f'bit_{i}' for i in range(len(binary_vectors_test_1.iloc[0]))])
+
+binary_df_train_2 = pd.DataFrame(binary_vectors_train_2.tolist(), columns=[f'bit_{i}' for i in range(len(binary_vectors_train_2.iloc[0]))])
+binary_df_test_2 = pd.DataFrame(binary_vectors_test_2.tolist(), columns=[f'bit_{i}' for i in range(len(binary_vectors_test_2.iloc[0]))])
+
+X_train_final = pd.concat([X_train_scaled_df, binary_df_train], axis=1)
+X_test_final = pd.concat([X_test_scaled_df, binary_df_test], axis=1)
+
+X_train_final_1 = pd.concat([X_train_scaled_df_1, binary_df_train_1], axis=1)
+X_test_final_1 = pd.concat([X_test_scaled_df_1, binary_df_test_1], axis=1)
+
+X_train_final_2 = pd.concat([X_train_scaled_df_2, binary_df_train_2], axis=1)
+X_test_final_2 = pd.concat([X_test_scaled_df_2, binary_df_test_2], axis=1)
+
+# Convert DataFrames to NumPy arrays
+X_train_np = X_train_final.values
+X_test_np = X_test_final.values
+
+X_train_np_1 = X_train_final_1.values
+X_test_np_1 = X_test_final_1.values
+
+X_train_np_2 = X_train_final_2.values
+X_test_np_2 = X_test_final_2.values
+
+def custom_distance(vector_1, vector_2, gamma_1, gamma_2):
+    '''
+    This function calculates a linear combination of the the euclidean and the tanimoto distances of two molecules
+    '''
+
+    # Ensure vector_1 and vector_2 are NumPy arrays for indexing
+    vector_1 = np.asarray(vector_1)
+    vector_2 = np.asarray(vector_2)
+
+    dist_1 = np.linalg.norm(vector_1[0:10] - vector_2[0:10])
+    dist_2 = tanimoto_coeff(vector_1[10:], vector_2[10:])
+    
+    return gamma_1 * dist_1 + gamma_2 * dist_2
+
+def tanimoto_coeff_matrix(X, Y):
+    '''
+    This function returns a matrix whose elements i,j are the tanimoto distances of the i-th fingerprint in X and the j-the fingerprint in Y
+    '''
+
+    intersection = np.dot(X, Y.T)
+    union = np.sum(X, axis=1)[:, None] + np.sum(Y, axis=1) - intersection
+    return 1 - (intersection / union)
+
+# Vectorized custom kernel function
+def custom_kernel(X, Y, gamma_1, gamma_2, kernel_type='rbf', degree=3):
+    '''
+    This function returns a matrix whose elements i,j are represents a customized metrics formed by a combination of the
+    Tanimoto and the Euclidean distances between the i-th molecule of X and the j-th molecule of Y
+    '''
+
+    # Euclidean distance for the first part
+    dist_1 = np.linalg.norm(X[:, :10, None] - Y[:, :10].T, axis=1)
+    
+    # Tanimoto distance for the second part
+    dist_2 = tanimoto_coeff_matrix(X[:, 10:], Y[:, 10:])
+    
+    if kernel_type == 'rbf':
+        return np.exp(-(gamma_1 * (dist_1**2) + gamma_2 * (dist_2**2) ))
+    elif kernel_type == 'linear':
+        return gamma_1 * dist_1 + gamma_2 * dist_2
+    elif kernel_type == 'polynomial':
+        return (1 + (gamma_1 * dist_1 + gamma_2 * dist_2)**2)**degree
+    else:
+        raise ValueError("Unsupported kernel type. Choose 'rbf', 'linear', or 'polynomial'.")
+
+
+""" kNN """
+
+
+def train_knn(X_train, y_train, X_test, y_test):
+    '''
+    This function finds the best hyperparameters for a k-NN Regressor.
+    A final model is then trained with the best hyperparameters and evaluated.
+    Optuna is used for optimization of the hyperparameters, given the ammount of hyperparameters
+        and the high cost of performing the optimization by Grid-Search cross validation.
+    '''
+
+    # Objective function for hyperparameter optimization with cross-validation
+    def objective(trial):
+        gamma_1 = trial.suggest_float("gamma_1", 0.1, 2.0)
+        gamma_2 = trial.suggest_float("gamma_2", 0.1, 2.0)
+        n_neighbors = trial.suggest_int("n_neighbors", 1, 20)
+        kernel_type = trial.suggest_categorical('kernel_type', ['rbf', 'linear', 'polynomial'])
+        degree = trial.suggest_int('degree', 2, 5) if kernel_type == 'polynomial' else None
+
+        K_train = custom_kernel(X_train, X_train, gamma_1, gamma_2, kernel_type=kernel_type, degree=degree)
+
+        knn = KNeighborsRegressor(n_neighbors=n_neighbors, metric="precomputed")
+
+        kf = KFold(n_splits=5)
+        scores = cross_val_score(knn, K_train, y_train.squeeze(), cv=kf, scoring='neg_mean_squared_error')
+
+        return -np.mean(scores)
+
+    # Run the optimization
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=200)
+
+    best_params = study.best_params
+    print("Best parameters:", best_params)
+
+    # Train the final model with the optimized parameters
+    gamma_1_opt = best_params["gamma_1"]
+    gamma_2_opt = best_params["gamma_2"]
+    n_neighbors_opt = best_params["n_neighbors"]
+    kernel_type_best = study.best_params['kernel_type']
+    degree_best = study.best_params['degree'] if kernel_type_best == 'polynomial' else None
+
+    model_final = KNeighborsRegressor(n_neighbors=n_neighbors_opt, metric="precomputed")
+    K_train_final = custom_kernel(X_train, X_train, gamma_1_opt, gamma_2_opt, kernel_type=kernel_type_best, degree=degree_best)
+    model_final.fit(K_train_final, y_train)
+
+    K_test_final = custom_kernel(X_test, X_train, gamma_1_opt, gamma_2_opt, kernel_type=kernel_type_best, degree=degree_best)
+    y_pred = model_final.predict(K_test_final)
+
+    # Calculate the final MSE on the test set
+    mse_test = mean_squared_error(y_test, y_pred)
+    pearson_corr, _ = pearsonr(y_test, y_pred)
+    print('Final test MSE: ', mse_test)
+    print(f'Pearson Correlation Coefficient: {pearson_corr}')
+    
+    '''
+    # Concatenate the training and test sets for the final training
+    X_full = np.concatenate((X_train, X_test), axis=0)
+    y_full = np.concatenate((y_train, y_test), axis=0)
+    K_full = custom_kernel(X_full, X_full, gamma_1_opt, gamma_2_opt, kernel_type=kernel_type_best, degree=degree_best)
+
+    model_final.fit(K_full, y_full.squeeze())
+    '''
+    
+    return model_final
+
+print("\nResults FA\n")
+print("Prediction of PCE with kNN")
+knn_pce = train_knn(X_train_np_1, y_train_1['PCE_ave(%)'], X_test_np_1, y_test_1['PCE_ave(%)'])
+print("Prediction of Jsc with kNN")
+knn_jsc = train_knn(X_train_np_1, y_train_1['Jsc(mA/cm2)'], X_test_np_1, y_test_1['Jsc(mA/cm2)'])
+print("Prediction of FF with kNN")
+knn_ff = train_knn(X_train_np_1, y_train_1['FF'], X_test_np_1, y_test_1['FF'])
+print("Prediction of Voc with kNN")
+knn_voc = train_knn(X_train_np_1, y_train_1['Voc(V)'], X_test_np_1, y_test_1['Voc(V)'])
+
+print("\nResults NFA\n")
+print("Prediction of PCE with kNN")
+knn_pce = train_knn(X_train_np_2, y_train_2['PCE_ave(%)'], X_test_np_2, y_test_2['PCE_ave(%)'])
+print("Prediction of Jsc with kNN")
+knn_jsc = train_knn(X_train_np_2, y_train_2['Jsc(mA/cm2)'], X_test_np_2, y_test_2['Jsc(mA/cm2)'])
+print("Prediction of FF with kNN")
+knn_ff = train_knn(X_train_np_2, y_train_2['FF'], X_test_np_2, y_test_2['FF'])
+print("Prediction of Voc with kNN")
+knn_voc = train_knn(X_train_np_2, y_train_2['Voc(V)'], X_test_np_2, y_test_2['Voc(V)'])
+
+print("\nResults FA+NFA\n")
+print("Prediction of PCE with kNN")
+knn_pce = train_knn(X_train_np, y_train['PCE_ave(%)'], X_test_np, y_test['PCE_ave(%)'])
+print("Prediction of Jsc with kNN")
+knn_jsc = train_knn(X_train_np, y_train['Jsc(mA/cm2)'], X_test_np, y_test['Jsc(mA/cm2)'])
+print("Prediction of FF with kNN")
+knn_ff = train_knn(X_train_np, y_train['FF'], X_test_np, y_test['FF'])
+print("Prediction of Voc with kNN")
+knn_voc = train_knn(X_train_np, y_train['Voc(V)'], X_test_np, y_test['Voc(V)'])
+
+
+""" KRR and SVR """
+
+
+def train_krr(X_train_np, y_train, X_test_np, y_test):
+    '''
+    This function finds the best hyperparameters for a Kernel Ridge Regressor.
+    A final model is then trained with the best hyperparameters and evaluated.
+    Optuna is used for optimization of the hyperparameters, given the ammount of hyperparameters
+        and the high cost of performing the optimization by Grid-Search cross validation.
+    '''
+
+    # Objective function for hyperparameter optimization with cross-validation
+    def objective(trial):
+        # Suggest hyperparameters for gamma_1, gamma_2, and alpha (for KRR)
+        gamma_1 = trial.suggest_float('gamma_1', 1e-3, 10.0)
+        gamma_2 = trial.suggest_float('gamma_2', 1e-3, 10.0)
+        alpha = trial.suggest_float('alpha', 1e-4, 1e1)
+        kernel_type = trial.suggest_categorical('kernel_type', ['rbf', 'linear', 'polynomial'])
+        degree = trial.suggest_int('degree', 2, 5) if kernel_type == 'polynomial' else None
+
+        # Compute custom kernel matrix for the whole training set
+        K_train = custom_kernel(X_train_np, X_train_np, gamma_1, gamma_2, kernel_type=kernel_type, degree=degree)
+
+        # Train Kernel Ridge Regressor with precomputed kernel
+        model = KernelRidge(kernel='precomputed', alpha=alpha)
+
+        # Perform cross-validation with neg_mean_squared_error
+        kf = KFold(n_splits=5)  # 5-fold cross-validation
+        scores = cross_val_score(model, K_train, y_train.squeeze(), cv=kf, scoring='neg_mean_squared_error')
+
+        # Return the average cross-validation score (MSE)
+        return -np.mean(scores)
+
+    # Perform Optuna study for hyperparameter optimization
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=200)
+
+    # Print the best hyperparameters found
+    print('Best hyperparameters: ', study.best_params)
+
+    # After tuning, evaluate the model on the test set
+    gamma_1_best = study.best_params['gamma_1']
+    gamma_2_best = study.best_params['gamma_2']
+    alpha_best = study.best_params['alpha']
+    kernel_type_best = study.best_params['kernel_type']
+    degree_best = study.best_params['degree'] if kernel_type_best == 'polynomial' else None
+
+    # Re-train the model with the entire training set and best hyperparameters
+    K_train_final = custom_kernel(X_train_np, X_train_np, gamma_1_best, gamma_2_best, kernel_type=kernel_type_best, degree=degree_best)
+    model_final = KernelRidge(kernel='precomputed', alpha=alpha_best)
+    model_final.fit(K_train_final, y_train.squeeze())
+
+    # Compute the kernel matrix for the test set and make predictions
+    K_test_final = custom_kernel(X_test_np, X_train_np, gamma_1_best, gamma_2_best, kernel_type=kernel_type_best, degree=degree_best)
+    y_pred = model_final.predict(K_test_final)
+
+    # Calculate the final MSE on the test set
+    mse_test = mean_squared_error(y_test, y_pred)
+    pearson_corr, _ = pearsonr(y_test, y_pred)
+    print('Final test MSE: ', mse_test)
+    print(f'Pearson Correlation Coefficient: {pearson_corr}')
+    
+    '''
+    # Concatenate the training and test sets for the final training
+    X_full = np.concatenate((X_train_np, X_test_np), axis=0)
+    y_full = np.concatenate((y_train, y_test), axis=0)
+    K_full = custom_kernel(X_full, X_full, gamma_1_best, gamma_2_best, kernel_type=kernel_type_best, degree=degree_best)
+
+    model_final.fit(K_full, y_full.squeeze())
+    '''
+
+    return model_final
+
+'''
+joblib can be used for saving the model
+'''
+
+print("\nResults FA\n")
+print("Prediction of PCE with KRR")
+final_krr_pce = train_krr(X_train_np_1, y_train_1['PCE_ave(%)'], X_test_np_1, y_test_1['PCE_ave(%)'])
+#joblib.dump(final_svr_pce, 'final_svr_pce_model.pkl') # Save the model to a file
+print("Prediction of Jsc with KRR")
+final_krr_jsc = train_krr(X_train_np_1, y_train_1['Jsc(mA/cm2)'], X_test_np_1, y_test_1['Jsc(mA/cm2)'])
+#joblib.dump(final_svr_jsc, 'final_svr_jsc_model.pkl') # Save the model to a file
+print("Prediction of FF with KRR")
+final_krr_ff = train_krr(X_train_np_1, y_train_1['FF'], X_test_np_1, y_test_1['FF'])
+#joblib.dump(final_svr_ff, 'final_svr_ff_model.pkl') # Save the model to a file
+print("Prediction of Voc with KRR")
+final_krr_voc = train_krr(X_train_np_1, y_train_1['Voc(V)'], X_test_np_1, y_test_1['Voc(V)'])
+#joblib.dump(final_svr_voc, 'final_svr_voc_model.pkl') # Save the model to a file
+
+print("\nResults NFA\n")
+print("Prediction of PCE with KRR")
+final_krr_pce = train_krr(X_train_np_2, y_train_2['PCE_ave(%)'], X_test_np_2, y_test_2['PCE_ave(%)'])
+#joblib.dump(final_svr_pce, 'final_svr_pce_model.pkl') # Save the model to a file
+print("Prediction of Jsc with KRR")
+final_krr_jsc = train_krr(X_train_np_2, y_train_2['Jsc(mA/cm2)'], X_test_np_2, y_test_2['Jsc(mA/cm2)'])
+#joblib.dump(final_svr_jsc, 'final_svr_jsc_model.pkl') # Save the model to a file
+print("Prediction of FF with KRR")
+final_krr_ff = train_krr(X_train_np_2, y_train_2['FF'], X_test_np_2, y_test_2['FF'])
+#joblib.dump(final_svr_ff, 'final_svr_ff_model.pkl') # Save the model to a file
+print("Prediction of Voc with KRR")
+final_krr_voc = train_krr(X_train_np_2, y_train_2['Voc(V)'], X_test_np_2, y_test_2['Voc(V)'])
+#joblib.dump(final_svr_voc, 'final_svr_voc_model.pkl') # Save the model to a file
+
+print("\nResults FA+NFA\n")
+print("Prediction of PCE with KRR")
+final_krr_pce = train_krr(X_train_np, y_train['PCE_ave(%)'], X_test_np, y_test['PCE_ave(%)'])
+#joblib.dump(final_svr_pce, 'final_svr_pce_model.pkl') # Save the model to a file
+print("Prediction of Jsc with KRR")
+final_krr_jsc = train_krr(X_train_np, y_train['Jsc(mA/cm2)'], X_test_np, y_test['Jsc(mA/cm2)'])
+#joblib.dump(final_svr_jsc, 'final_svr_jsc_model.pkl') # Save the model to a file
+print("Prediction of FF with KRR")
+final_krr_ff = train_krr(X_train_np, y_train['FF'], X_test_np, y_test['FF'])
+#joblib.dump(final_svr_ff, 'final_svr_ff_model.pkl') # Save the model to a file
+print("Prediction of Voc with KRR")
+final_krr_voc = train_krr(X_train_np, y_train['Voc(V)'], X_test_np, y_test['Voc(V)'])
+#joblib.dump(final_svr_voc, 'final_svr_voc_model.pkl') # Save the model to a file
+
+
+def train_svr(X_train_np, y_train, X_test_np, y_test):
+    '''
+    This function finds the best hyperparameters for a Support Vector Regressor.
+    A final model is then trained with the best hyperparameters and evaluated.
+    Optuna is used for optimization of the hyperparameters, given the ammount of hyperparameters
+        and the high cost of performing the optimization by Grid-Search cross validation.
+    '''
+
+    # Objective function for hyperparameter optimization with cross-validation
+    def objective(trial):
+        # Suggest hyperparameters for gamma_1, gamma_2, and C (for SVR)
+        gamma_1 = trial.suggest_float('gamma_1', 1e-3, 10.0)
+        gamma_2 = trial.suggest_float('gamma_2', 1e-3, 10.0)
+        epsilon = trial.suggest_float('epsilon', 1e-4, 1e-1)
+        C = trial.suggest_float('C', 1e-2, 1e2)
+        kernel_type = trial.suggest_categorical('kernel_type', ['rbf', 'linear', 'polynomial'])
+        degree = trial.suggest_int('degree', 2, 5) if kernel_type == 'polynomial' else None
+
+        # Compute custom kernel matrix for the whole training set
+        K_train = custom_kernel(X_train_np, X_train_np, gamma_1, gamma_2, kernel_type=kernel_type, degree=degree)
+
+        # Train SVR model with precomputed kernel
+        model = SVR(kernel='precomputed', C=C, epsilon=epsilon)
+
+        # Perform cross-validation with neg_mean_squared_error
+        kf = KFold(n_splits=5)  # 5-fold cross-validation
+        scores = cross_val_score(model, K_train, y_train.squeeze(), cv=kf, scoring='neg_mean_squared_error')
+
+        # Return the average cross-validation score (MSE)
+        return -np.mean(scores)
+
+    # Perform Optuna study for hyperparameter optimization
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=200)
+
+    # Print the best hyperparameters found
+    print('Best hyperparameters: ', study.best_params)
+
+    # After tuning, evaluate the model on the test set
+    gamma_1_best = study.best_params['gamma_1']
+    gamma_2_best = study.best_params['gamma_2']
+    C_best = study.best_params['C']
+    epsilon_best = study.best_params['epsilon']
+    kernel_type_best = study.best_params['kernel_type']
+    degree_best = study.best_params['degree'] if kernel_type_best == 'polynomial' else None
+
+    # Re-train the model with the entire training set and best hyperparameters
+    K_train_final = custom_kernel(X_train_np, X_train_np, gamma_1_best, gamma_2_best, kernel_type=kernel_type_best, degree=degree_best)
+    model_final = SVR(kernel='precomputed', C=C_best, epsilon=epsilon_best)
+    model_final.fit(K_train_final, y_train.squeeze())
+
+    # Compute the kernel matrix for the test set and make predictions
+    K_test_final = custom_kernel(X_test_np, X_train_np, gamma_1_best, gamma_2_best, kernel_type=kernel_type_best, degree=degree_best)
+    y_pred = model_final.predict(K_test_final)
+
+    # Calculate the final MSE on the test set
+    mse_test = mean_squared_error(y_test, y_pred)
+    pearson_corr, _ = pearsonr(y_test, y_pred)
+    print('Final test MSE: ', mse_test)
+    print(f'Pearson Correlation Coefficient: {pearson_corr}')
+    
+    '''
+    # Concatenate the training and test sets for the final training
+    X_full = np.concatenate((X_train_np, X_test_np), axis=0)
+    y_full = np.concatenate((y_train, y_test), axis=0)
+    K_full = custom_kernel(X_full, X_full, gamma_1_best, gamma_2_best, kernel_type=kernel_type_best, degree=degree_best)
+
+    model_final.fit(K_full, y_full.squeeze())
+    '''
+    
+    return model_final
+
+print("\nResults FA\n")
+print("Prediction of PCE with SVR")
+final_svr_pce = train_svr(X_train_np_1, y_train_1['PCE_ave(%)'], X_test_np_1, y_test_1['PCE_ave(%)'])
+#joblib.dump(final_svr_pce, 'final_svr_pce_model.pkl') # Save the model to a file
+print("Prediction of Jsc with SVR")
+final_svr_jsc = train_svr(X_train_np_1, y_train_1['Jsc(mA/cm2)'], X_test_np_1, y_test_1['Jsc(mA/cm2)'])
+#joblib.dump(final_svr_jsc, 'final_svr_jsc_model.pkl') # Save the model to a file
+print("Prediction of FF with SVR")
+final_svr_ff = train_svr(X_train_np_1, y_train_1['FF'], X_test_np_1, y_test_1['FF'])
+#joblib.dump(final_svr_ff, 'final_svr_ff_model.pkl') # Save the model to a file
+print("Prediction of Voc with SVR")
+final_svr_voc = train_svr(X_train_np_1, y_train_1['Voc(V)'], X_test_np_1, y_test_1['Voc(V)'])
+#joblib.dump(final_svr_voc, 'final_svr_voc_model.pkl') # Save the model to a file
+
+print("\nResults NFA\n")
+print("Prediction of PCE with SVR")
+final_svr_pce = train_svr(X_train_np_2, y_train_2['PCE_ave(%)'], X_test_np_2, y_test_2['PCE_ave(%)'])
+#joblib.dump(final_svr_pce, 'final_svr_pce_model.pkl') # Save the model to a file
+print("Prediction of Jsc with SVR")
+final_svr_jsc = train_svr(X_train_np_2, y_train_2['Jsc(mA/cm2)'], X_test_np_2, y_test_2['Jsc(mA/cm2)'])
+#joblib.dump(final_svr_jsc, 'final_svr_jsc_model.pkl') # Save the model to a file
+print("Prediction of FF with SVR")
+final_svr_ff = train_svr(X_train_np_2, y_train_2['FF'], X_test_np_2, y_test_2['FF'])
+#joblib.dump(final_svr_ff, 'final_svr_ff_model.pkl') # Save the model to a file
+print("Prediction of Voc with SVR")
+final_svr_voc = train_svr(X_train_np_2, y_train_2['Voc(V)'], X_test_np_2, y_test_2['Voc(V)'])
+#joblib.dump(final_svr_voc, 'final_svr_voc_model.pkl') # Save the model to a file
+
+print("\nResults FA+NFA\n")
+print("Prediction of PCE with SVR")
+final_svr_pce = train_svr(X_train_np, y_train['PCE_ave(%)'], X_test_np, y_test['PCE_ave(%)'])
+#joblib.dump(final_svr_pce, 'final_svr_pce_model.pkl') # Save the model to a file
+print("Prediction of Jsc with SVR")
+final_svr_jsc = train_svr(X_train_np, y_train['Jsc(mA/cm2)'], X_test_np, y_test['Jsc(mA/cm2)'])
+#joblib.dump(final_svr_jsc, 'final_svr_jsc_model.pkl') # Save the model to a file
+print("Prediction of FF with SVR")
+final_svr_ff = train_svr(X_train_np, y_train['FF'], X_test_np, y_test['FF'])
+#joblib.dump(final_svr_ff, 'final_svr_ff_model.pkl') # Save the model to a file
+print("Prediction of Voc with SVR")
+final_svr_voc = train_svr(X_train_np, y_train['Voc(V)'], X_test_np, y_test['Voc(V)'])
+#joblib.dump(final_svr_voc, 'final_svr_voc_model.pkl') # Save the model to a file
