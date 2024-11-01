@@ -29,14 +29,14 @@ print(f'Using device: {device}')
 
 #### Preprocessing Data ####
 
-df1 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\FA_Polymer\final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+df1 = pd.read_csv('final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
 df1 = df1.rename(columns={'PDI(=Mw/Mn)': 'PDI', 'Monomer(g/m)':'M(g/mol)'})
 df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].replace('-', np.nan)
 df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].apply(pd.to_numeric, errors='coerce')
 df1= df1.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
 df1 = df1.dropna()
 
-df2 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\NFA_Polymer\final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+df2 = pd.read_csv('final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
 df2 = df2.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
 df2 = df2.dropna()
 
