@@ -50,7 +50,7 @@ def load_data(data = "others"):
         df1['-delta_HL_np'] = df1['-HOMO_n(eV)'] - df1['-LUMO_p(eV)']
         df1['-delta_LH_np'] = df1['-LUMO_n(eV)'] - df1['-HOMO_p(eV)']
 
-        df2 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\NFA_Polymer\final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+        df2 = pd.read_csv('final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
         df2 = df2.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
         df2 = df2.dropna()
 
@@ -82,14 +82,14 @@ def load_data(data = "others"):
     elif (data == 'compressed_fingerprints'):        
         def is_binary(fp):
             return isinstance(fp, str) and all(char in '01' for char in fp)
-        df1 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\FA_Polymer\final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+        df1 = pd.read_csv('final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
         df1 = df1[df1[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
         df1['CDK_fp']    = df1['n(CDK Fingerprint)'] + df1['p(CDK Fingerprint)']
         df1['RDKit_fp']  = df1['n(RDKit Fingerprint)'] + df1['p(RDKit Fingerprint)']
         df1['Morgan_fp'] = df1['n(Morgan Fingerprint)'] + df1['p(Morgan Fingerprint)']
         df1 = df1[['CDK_fp', 'RDKit_fp', 'Morgan_fp', 'PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']].reset_index(drop=True)
 
-        df2 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\NFA_Polymer\final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+        df2 = pd.read_csv('final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
         df2 = df2[df2[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
         df2['CDK_fp']    = df2['n(CDK Fingerprint)'] + df2['p(CDK Fingerprint)']
         df2['RDKit_fp']  = df2['n(RDKit Fingerprint)'] + df2['p(RDKit Fingerprint)']
