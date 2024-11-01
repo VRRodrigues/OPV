@@ -1,0 +1,639 @@
+# -*- coding: utf-8 -*-
+"""
+@author: vicre
+
+This code is made for training and optimization of the hyperparameters of the following tree models:
+  - Random Forest (RF)
+  - AdaBoost
+  - CatBoost
+  - XGBoost
+  - LightBoost
+
+Hyperparameter parameter optimization was carried with Optuna or BayesSearchCV.
+
+The context considered are:
+  - Trainig of models only considering the other descriptors, ignoring fingerprints.
+  - Trainig of models only considering a compressed 32-dimensional representation of the fingerprints of molecules obtained by an autoencoder.
+
+"""
+
+
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+from skopt import BayesSearchCV
+import optuna
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import pearsonr
+
+
+
+#### Data Preprocessing ####
+
+def load_data(data = "others"):
+    if (data == "others"):
+        df1 = pd.read_csv('final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+        df1 = df1.rename(columns={'PDI(=Mw/Mn)': 'PDI', 'Monomer(g/m)':'M(g/mol)'})
+        df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].replace('-', np.nan)
+        df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].apply(pd.to_numeric, errors='coerce')
+        df1= df1.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
+        df1 = df1.dropna()
+
+        df1['-delta_HL_nn'] = df1['-HOMO_n(eV)'] - df1['-LUMO_n(eV)']
+        df1['-delta_HL_pp'] = df1['-HOMO_p(eV)'] - df1['-LUMO_p(eV)']
+        df1['-delta_HH_np'] = df1['-HOMO_n(eV)'] - df1['-HOMO_p(eV)']
+        df1['-delta_LL_np'] = df1['-LUMO_n(eV)'] - df1['-LUMO_p(eV)']
+        df1['-delta_HL_np'] = df1['-HOMO_n(eV)'] - df1['-LUMO_p(eV)']
+        df1['-delta_LH_np'] = df1['-LUMO_n(eV)'] - df1['-HOMO_p(eV)']
+
+        df2 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\NFA_Polymer\final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+        df2 = df2.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
+        df2 = df2.dropna()
+
+        df2['-delta_HL_nn'] = df2['-HOMO_n(eV)'] - df2['-LUMO_n(eV)']
+        df2['-delta_HL_pp'] = df2['-HOMO_p(eV)'] - df2['-LUMO_p(eV)']
+        df2['-delta_HH_np'] = df2['-HOMO_n(eV)'] - df2['-HOMO_p(eV)']
+        df2['-delta_LL_np'] = df2['-LUMO_n(eV)'] - df2['-LUMO_p(eV)']
+        df2['-delta_HL_np'] = df2['-HOMO_n(eV)'] - df2['-LUMO_p(eV)']
+        df2['-delta_LH_np'] = df2['-LUMO_n(eV)'] - df2['-HOMO_p(eV)']
+
+        df = pd.concat([df1, df2], ignore_index=True)
+    
+        X = df[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI',
+                '-delta_HL_nn', '-delta_HL_pp', '-delta_HH_np', '-delta_LL_np', '-delta_HL_np', '-delta_LH_np']]
+        y = df[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+        X_1 = df1[['M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI',
+                   '-delta_HL_pp', '-delta_HH_np', '-delta_LL_np', '-delta_HL_np', '-delta_LH_np']]
+        y_1 = df1[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+        X_2 = df2[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI',
+                   '-delta_HL_nn', '-delta_HL_pp', '-delta_HH_np', '-delta_LL_np', '-delta_HL_np', '-delta_LH_np']]
+        y_2 = df2[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+    
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        X_train_1, X_test_1, y_train_1, y_test_1 = train_test_split(X_1, y_1, test_size=0.2, random_state=42)
+        X_train_2, X_test_2, y_train_2, y_test_2 = train_test_split(X_2, y_2, test_size=0.2, random_state=42)
+        
+        return X, y, X_1, y_1, X_2, y_2, X_train, X_test, y_train, y_test, X_train_1, X_test_1, y_train_1, y_test_1, X_train_2, X_test_2, y_train_2, y_test_2
+    
+    elif (data == 'compressed_fingerprints'):        
+        def is_binary(fp):
+            return isinstance(fp, str) and all(char in '01' for char in fp)
+        df1 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\FA_Polymer\final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+        df1 = df1[df1[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
+        df1['CDK_fp']    = df1['n(CDK Fingerprint)'] + df1['p(CDK Fingerprint)']
+        df1['RDKit_fp']  = df1['n(RDKit Fingerprint)'] + df1['p(RDKit Fingerprint)']
+        df1['Morgan_fp'] = df1['n(Morgan Fingerprint)'] + df1['p(Morgan Fingerprint)']
+        df1 = df1[['CDK_fp', 'RDKit_fp', 'Morgan_fp', 'PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']].reset_index(drop=True)
+
+        df2 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\NFA_Polymer\final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+        df2 = df2[df2[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
+        df2['CDK_fp']    = df2['n(CDK Fingerprint)'] + df2['p(CDK Fingerprint)']
+        df2['RDKit_fp']  = df2['n(RDKit Fingerprint)'] + df2['p(RDKit Fingerprint)']
+        df2['Morgan_fp'] = df2['n(Morgan Fingerprint)'] + df2['p(Morgan Fingerprint)']
+        df2 = df2[['CDK_fp', 'RDKit_fp', 'Morgan_fp', 'PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']].reset_index(drop=True)
+
+        df = pd.concat([df1, df2], ignore_index=True)[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)', 'Morgan_fp']]
+
+        # compressed fingerprints
+        df3 = pd.read_csv('combined_data_compression_autoencoder.csv', delimiter=',')
+
+        # Merge dataframes based on the 'Morgan_fp' column
+        merged_df = pd.merge(df, df3, on='Morgan_fp', how='inner')
+        X = merged_df[[str(i) for i in range(32)]]
+        y = merged_df[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        return X, y, X_train, X_test, y_train, y_test
+
+# Choice of data among:
+# 1) The compressed fingerprints, or
+# 2) The other descriptors
+data = 'compressed_fingerprints'
+
+if data == 'others':
+    X, y, X_1, y_1, X_2, y_2, X_train, X_test, y_train, y_test, X_train_1, X_test_1, y_train_1, y_test_1, X_train_2, X_test_2, y_train_2, y_test_2 = load_data(data)
+elif data == 'compressed_fingerprints':
+    X, y, X_train, X_test, y_train, y_test = load_data(data)
+
+def evaluate_model(model, X_test, y_test, filename):
+    y_pred = model.predict(X_test)
+
+    if len(y_pred.shape) == 2 and y_pred.shape[1] == 1:
+        y_pred = y_pred.ravel()
+    if len(y_test.shape) == 2 and y_test.shape[1] == 1:
+        y_test = y_test.values.ravel()
+    
+    mse = mean_squared_error(y_test, y_pred)
+    pearson_corr, _ = pearsonr(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    print(f'Test MSE: {mse:.4f}')
+    print(f'Pearson Correlation Coefficient: {pearson_corr:.4f}')
+    print(f"R^2 Score: {r2}")
+    
+    if filename is not None:
+        # Save metrics to file
+        result = f"Test MSE: {mse:.4f}, Pearson Correlation: {pearson_corr:.4f}, R^2 Score: {r2:.4f}"
+        save_results_to_file(filename, result)
+    
+    return mse, pearson_corr, r2
+
+def plot_feature_importance(model, title_complement, feature_names = X.columns):
+    '''
+    This function plots a histogram with feature importances
+    '''
+
+    try:
+        importances = model.feature_importances_  # For AdaBoost, XGBoost, LightGBM, RF
+    except AttributeError:
+        importances = model.get_feature_importance()  # For CatBoost
+
+    indices = np.argsort(importances)[::-1]  # Sort in descending order
+    
+    # Print feature importances
+    print("Feature Importances:")
+    for i in range(len(feature_names)):
+        print(f"{i+1}. {feature_names[indices[i]]}: {importances[indices[i]]:.4f}")
+
+    plt.figure(figsize=(10, 6))    
+    sns.barplot(x=importances[indices], y=np.array(feature_names)[indices])
+    plt.title(f"Feature Importances ({model.__class__.__name__}), {title_complement}")
+    plt.show()
+
+
+
+""" Random Forest """
+
+
+
+def train_rf(X_train, y_train):
+    '''
+    This function finds the best hyperparameters for a Random Forest Regressor.
+    It returns a final model trained in the training set with the best hyperparameters
+    Bayes Search 3-fold cross validation is used for optimization of the hyperparameters.
+    '''
+
+    # Define the parameter space for Bayesian Optimization
+    param_space = {
+        'n_estimators': (100, 1000),               # Range for number of trees
+        'max_depth': (5, 50),                     # Range for maximum depth
+        'max_features': ['log2', 'sqrt'],
+        'min_samples_split': (2, 10),             # Minimum number of samples to split a node
+        'min_samples_leaf': (1, 10),              # Minimum number of samples per leaf node
+        'bootstrap': [True, False]                # Use bootstrap samples or not
+        }
+
+    rf = RandomForestRegressor(random_state=42)
+
+    # Set up Bayesian optimization with BayesSearchCV
+    opt = BayesSearchCV(
+        estimator=rf,
+        search_spaces=param_space,
+        n_iter=100,                  # Number of parameter settings sampled
+        cv=3,                       # 3-fold cross-validation
+        n_jobs=-1,                  # Use all available cores
+        random_state=42
+        )
+
+    opt.fit(X_train, y_train)
+    print("Best hyperparameters found by Bayesian Optimization:", opt.best_params_)
+    best_rf = opt.best_estimator_
+    
+    return best_rf
+
+print("\nResults FA+NFA\n")
+rf_pce = train_rf(X_train, y_train['PCE_ave(%)'])
+evaluate_model(rf_pce, X_test, y_test['PCE_ave(%)'])
+rf_jsc = train_rf(X_train, y_train['Jsc(mA/cm2)'])
+evaluate_model(rf_jsc, X_test, y_test['Jsc(mA/cm2)'])
+rf_voc = train_rf(X_train, y_train['Voc(V)'])
+evaluate_model(rf_voc, X_test, y_test['Voc(V)'])
+rf_ff  = train_rf(X_train, y_train['FF'])
+evaluate_model(rf_ff, X_test, y_test['FF'])
+
+print("\nResults FA\n")
+rf_pce = train_rf(X_train_1, y_train_1['PCE_ave(%)'])
+evaluate_model(rf_pce, X_test_1, y_test_1['PCE_ave(%)'])
+rf_jsc = train_rf(X_train_1, y_train_1['Jsc(mA/cm2)'])
+evaluate_model(rf_jsc, X_test_1, y_test_1['Jsc(mA/cm2)'])
+rf_voc = train_rf(X_train_1, y_train_1['Voc(V)'])
+evaluate_model(rf_voc, X_test_1, y_test_1['Voc(V)'])
+rf_ff  = train_rf(X_train_1, y_train_1['FF'])
+evaluate_model(rf_ff, X_test_1, y_test_1['FF'])
+
+plot_feature_importance(rf_pce, title_complement = "PCE", feature_names = X_1.columns)
+plot_feature_importance(rf_jsc, title_complement = "Jsc", feature_names = X_1.columns)
+plot_feature_importance(rf_voc, title_complement = "Voc", feature_names = X_1.columns)
+plot_feature_importance(rf_ff, title_complement = "FF", feature_names = X_1.columns)
+
+print("\nResults NFA\n")
+rf_pce = train_rf(X_train_2, y_train_2['PCE_ave(%)'])
+evaluate_model(rf_pce, X_test_2, y_test_2['PCE_ave(%)'])
+rf_jsc = train_rf(X_train_2, y_train_2['Jsc(mA/cm2)'])
+evaluate_model(rf_jsc, X_test_2, y_test_2['Jsc(mA/cm2)'])
+rf_voc = train_rf(X_train_2, y_train_2['Voc(V)'])
+evaluate_model(rf_voc, X_test_2, y_test_2['Voc(V)'])
+rf_ff  = train_rf(X_train_2, y_train_2['FF'])
+evaluate_model(rf_ff, X_test_2, y_test_2['FF'])
+
+plot_feature_importance(rf_pce, title_complement = "PCE")
+plot_feature_importance(rf_jsc, title_complement = "Jsc")
+plot_feature_importance(rf_voc, title_complement = "Voc")
+plot_feature_importance(rf_ff, title_complement = "FF")
+
+
+
+""" Ada Boost """
+
+
+
+from sklearn.ensemble import AdaBoostRegressor
+
+def train_ada(X_train, y_train):
+    '''
+    This function finds the best hyperparameters for an AdaBoost Regressor.
+    It returns a final model trained in the training set with the best hyperparameters
+    Bayes Search 3-fold cross validation is used for optimization of the hyperparameters.
+    '''
+
+    ada = AdaBoostRegressor(random_state=42)
+
+    # Define parameter space
+    param_space_ada = {
+        'n_estimators': (50, 500),
+        'learning_rate': (0.01, 1.0, 'log-uniform'),
+        }
+
+    # Set up Bayesian optimization for AdaBoost
+    opt_ada = BayesSearchCV(
+        estimator=ada,
+        search_spaces=param_space_ada,
+        n_iter=100,                  # Number of parameter settings sampled
+        cv=3,                       # 3-fold cross-validation
+        n_jobs=-1,                  # Use all available cores
+        random_state=42
+        )
+
+    opt_ada.fit(X_train, y_train)
+    print("Best hyperparameters (AdaBoost):", opt_ada.best_params_)
+    best_ada = opt_ada.best_estimator_
+    
+    return best_ada
+
+print("\nResults FA+NFA\n")
+ada_pce = train_ada(X_train, y_train['PCE_ave(%)'])
+evaluate_model(ada_pce, X_test, y_test['PCE_ave(%)'])
+ada_jsc = train_ada(X_train, y_train['Jsc(mA/cm2)'])
+evaluate_model(ada_jsc, X_test, y_test['Jsc(mA/cm2)'])
+ada_voc = train_ada(X_train, y_train['Voc(V)'])
+evaluate_model(ada_voc, X_test, y_test['Voc(V)'])
+ada_ff  = train_ada(X_train, y_train['FF'])
+evaluate_model(ada_ff, X_test, y_test['FF'])
+
+print("\nResults FA\n")
+ada_pce = train_ada(X_train_1, y_train_1['PCE_ave(%)'])
+evaluate_model(ada_pce, X_test_1, y_test_1['PCE_ave(%)'])
+ada_jsc = train_ada(X_train_1, y_train_1['Jsc(mA/cm2)'])
+evaluate_model(ada_jsc, X_test_1, y_test_1['Jsc(mA/cm2)'])
+ada_voc = train_ada(X_train_1, y_train_1['Voc(V)'])
+evaluate_model(ada_voc, X_test_1, y_test_1['Voc(V)'])
+ada_ff  = train_ada(X_train_1, y_train_1['FF'])
+evaluate_model(ada_ff, X_test_1, y_test_1['FF'])
+
+plot_feature_importance(ada_pce, title_complement = "PCE", feature_names = X_1.columns)
+plot_feature_importance(ada_jsc, title_complement = "Jsc", feature_names = X_1.columns)
+plot_feature_importance(ada_voc, title_complement = "Voc", feature_names = X_1.columns)
+plot_feature_importance(ada_ff, title_complement = "FF", feature_names = X_1.columns)
+
+print("\nResults NFA\n")
+ada_pce = train_ada(X_train_2, y_train_2['PCE_ave(%)'])
+evaluate_model(ada_pce, X_test_2, y_test_2['PCE_ave(%)'])
+ada_jsc = train_ada(X_train_2, y_train_2['Jsc(mA/cm2)'])
+evaluate_model(ada_jsc, X_test_2, y_test_2['Jsc(mA/cm2)'])
+ada_voc = train_ada(X_train_2, y_train_2['Voc(V)'])
+evaluate_model(ada_voc, X_test_2, y_test_2['Voc(V)'])
+ada_ff  = train_ada(X_train_2, y_train_2['FF'])
+evaluate_model(ada_ff, X_test_2, y_test_2['FF'])
+
+plot_feature_importance(ada_pce, title_complement = "PCE")
+plot_feature_importance(ada_jsc, title_complement = "Jsc")
+plot_feature_importance(ada_voc, title_complement = "Voc")
+plot_feature_importance(ada_ff, title_complement = "FF")
+
+
+
+""" Cat Boost """
+
+
+
+import torch
+from catboost import CatBoostRegressor, cv, Pool
+import shutil # Import shutil for directory removal
+
+def train_cat(X_train, y_train):
+    '''
+    This function finds the best hyperparameters for a Cat Boost Regressor.
+    It returns a final model trained in the training set with the best hyperparameters
+    Bayes Search 3-fold cross validation is used for optimization of the hyperparameters.
+    '''
+
+    catboost = CatBoostRegressor(verbose=0, random_seed=42)
+
+    # Define parameter space, including subsample and bootstrap_type
+    param_space_cat = {
+        'iterations': (100, 500),
+        'depth': (1, 10),
+        'learning_rate': (0.01, 1.0, 'log-uniform'),
+        'l2_leaf_reg': (1e-5, 100, 'log-uniform'),
+        'bagging_temperature': (0.0, 1.0),
+        'boosting_type': ['Ordered', 'Plain'],
+        'subsample': (0.9, 1.0),  # Limit sampling rate closer to 1.0
+        'bootstrap_type': ['Bayesian', 'Bernoulli']  # Avoid 'MVS' for small datasets
+    }
+
+    # Set up Bayesian optimization for CatBoost
+    opt_cat = BayesSearchCV(
+        estimator=catboost,
+        search_spaces=param_space_cat,
+        n_iter=100,                 # Number of parameter settings sampled
+        cv=3,                      # 3-fold cross-validation
+        n_jobs=-1,                 # Use all available cores
+        random_state=42
+    )
+
+    opt_cat.fit(X_train, y_train)
+    print("Best hyperparameters (CatBoost):", opt_cat.best_params_)
+    best_cat = opt_cat.best_estimator_
+    
+    return best_cat
+
+def train_cat_optuna(X_train, y_train, filename):
+    '''
+    This function finds the best hyperparameters for a Cat Boost Regressor.
+    It returns a final model trained in the training set with the best hyperparameters
+    Optuna is used for optimization of the hyperparameters, since in some cases, the BayesSearchCV was not able to perform the optimization
+    '''
+
+    def objective(trial):
+        # Define hyperparameters with Optuna suggestions
+        params = {
+            'iterations': trial.suggest_int('iterations', 100, 500),
+            'depth': trial.suggest_int('depth', 1, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 1.0, log=True),
+            'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1e-5, 100, log=True),
+            'boosting_type': trial.suggest_categorical('boosting_type', ['Ordered', 'Plain']),
+            'bootstrap_type': trial.suggest_categorical('bootstrap_type', ['Bayesian', 'Bernoulli']),
+            'random_seed': 42,  # Set seed within params to avoid duplication
+            'verbose': 0,
+            'task_type': "GPU" if torch.cuda.is_available() else 'CPU',
+            'loss_function': 'RMSE'
+        }
+
+        # Conditional parameters
+        if params['bootstrap_type'] == 'Bernoulli':
+            params['subsample'] = trial.suggest_float('subsample', 0.9, 1.0)
+        elif params['bootstrap_type'] == 'Bayesian':
+            params['bagging_temperature'] = trial.suggest_float('bagging_temperature', 0.0, 1.0)
+
+        cv_data = Pool(X_train, y_train)
+        cv_results = cv(cv_data, params, fold_count=3, logging_level='Silent')
+        
+        # Calculate the mean cross-validation loss (MSE)
+        mean_cv_loss = cv_results['test-RMSE-mean'].values[-1]
+        
+        return mean_cv_loss
+
+    # Remove the 'catboost_info' directory if it exists before starting Optuna
+    train_dir = 'catboost_info'
+    if os.path.exists(train_dir):
+        shutil.rmtree(train_dir)
+    
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=80)
+    
+    # Retrieve best parameters and fit the final model
+    best_params = study.best_params
+    best_params['task_type'] = 'GPU' if torch.cuda.is_available() else 'CPU'
+    best_params['loss_function'] = 'RMSE'
+    best_params['random_seed'] = 42  # Ensure seed consistency in final model
+    best_model = CatBoostRegressor(**best_params, verbose=0)
+    best_model.fit(X_train, y_train)
+    
+    best_params_str = f"Best hyperparameters (CatBoost): {best_params}"
+    print(best_params_str)
+    if filename is not None:
+        save_results_to_file(filename, best_params_str)
+    
+    return best_model
+
+print("\nResults FA+NFA\n")
+cat_pce = train_cat_optuna(X_train, y_train['PCE_ave(%)'], filename = "Hyperp_pce")
+evaluate_model(cat_pce, X_test, y_test['PCE_ave(%)'], filename= "Metrics_pce")
+cat_jsc = train_cat_optuna(X_train, y_train['Jsc(mA/cm2)'], filename= "Hyperp_jsc")
+evaluate_model(cat_jsc, X_test, y_test['Jsc(mA/cm2)'], filename= "Metrics_jsc")
+cat_voc = train_cat_optuna(X_train, y_train['Voc(V)'], filename= "Hyperp_voc")
+evaluate_model(cat_voc, X_test, y_test['Voc(V)'], filename= "Metrics_voc")
+cat_ff  = train_cat_optuna(X_train, y_train['FF'], filename= "Hyperp_ff")
+evaluate_model(cat_ff, X_test, y_test['FF'], filename= "Metrics_ff")
+
+print("\nResults FA\n")
+cat_pce = train_cat(X_train_1, y_train_1['PCE_ave(%)'])
+evaluate_model(cat_pce, X_test_1, y_test_1['PCE_ave(%)'])
+cat_jsc = train_cat(X_train_1, y_train_1['Jsc(mA/cm2)'])
+evaluate_model(cat_jsc, X_test_1, y_test_1['Jsc(mA/cm2)'])
+cat_voc = train_cat_optuna(X_train_1, y_train_1['Voc(V)'])
+evaluate_model(cat_voc, X_test_1, y_test_1['Voc(V)'])
+cat_ff  = train_cat(X_train_1, y_train_1['FF'])
+evaluate_model(cat_ff, X_test_1, y_test_1['FF'])
+
+plot_feature_importance(cat_pce, title_complement = "PCE", feature_names = X_1.columns)
+plot_feature_importance(cat_jsc, title_complement = "Jsc", feature_names = X_1.columns)
+plot_feature_importance(cat_voc, title_complement = "Voc", feature_names = X_1.columns)
+plot_feature_importance(cat_ff, title_complement = "FF", feature_names = X_1.columns)
+
+print("\nResults NFA\n")
+cat_pce = train_cat(X_train_2, y_train_2['PCE_ave(%)'])
+evaluate_model(cat_pce, X_test_2, y_test_2['PCE_ave(%)'])
+cat_jsc = train_cat(X_train_2, y_train_2['Jsc(mA/cm2)'])
+evaluate_model(cat_jsc, X_test_2, y_test_2['Jsc(mA/cm2)'])
+cat_voc = train_cat(X_train_2, y_train_2['Voc(V)'])
+evaluate_model(cat_voc, X_test_2, y_test_2['Voc(V)'])
+cat_ff  = train_cat(X_train_2, y_train_2['FF'])
+evaluate_model(cat_ff, X_test_2, y_test_2['FF'])
+
+plot_feature_importance(cat_pce, title_complement = "PCE")
+plot_feature_importance(cat_jsc, title_complement = "Jsc")
+plot_feature_importance(cat_voc, title_complement = "Voc")
+plot_feature_importance(cat_ff, title_complement = "FF")
+
+
+
+""" XGBoost """
+
+
+
+from xgboost import XGBRegressor
+
+def train_xgb(X_train, y_train):
+    '''
+    This function finds the best hyperparameters for a XGBoost Regressor.
+    It returns a final model trained in the training set with the best hyperparameters
+    Bayes Search 3-fold cross validation is used for optimization of the hyperparameters.
+    '''
+
+    xgb = XGBRegressor(random_state=42, verbosity=0)
+
+    # Define parameter space
+    param_space_xgb = {
+        'n_estimators': (100, 500),
+        'max_depth': (3, 10),
+        'learning_rate': (0.01, 1.0, 'log-uniform'),
+        'subsample': (0.5, 1.0),
+        'colsample_bytree': (0.5, 1.0),
+        'gamma': (1e-8, 1.0, 'log-uniform')
+        }
+
+    # Set up Bayesian optimization for XGBoost
+    opt_xgb = BayesSearchCV(
+        estimator=xgb,
+        search_spaces=param_space_xgb,
+        n_iter=100,                # Number of parameter settings sampled
+        cv=3,                     # 3-fold cross-validation
+        n_jobs=-1,                # Use all available cores
+        random_state=42
+        )
+
+    # Fit and evaluate XGBoost model
+    opt_xgb.fit(X_train, y_train)
+    print("Best hyperparameters (XGBoost):", opt_xgb.best_params_)
+    best_xgb = opt_xgb.best_estimator_
+
+    return best_xgb
+
+print("\nResults FA+NFA\n")
+xgb_pce = train_xgb(X_train, y_train['PCE_ave(%)'])
+evaluate_model(xgb_pce, X_test, y_test['PCE_ave(%)'])
+xgb_jsc = train_xgb(X_train, y_train['Jsc(mA/cm2)'])
+evaluate_model(xgb_jsc, X_test, y_test['Jsc(mA/cm2)'])
+xgb_voc = train_xgb(X_train, y_train['Voc(V)'])
+evaluate_model(xgb_voc, X_test, y_test['Voc(V)'])
+xgb_ff  = train_xgb(X_train, y_train['FF'])
+evaluate_model(xgb_ff, X_test, y_test['FF'])
+
+print("\nResults FA\n")
+xgb_pce = train_xgb(X_train_1, y_train_1['PCE_ave(%)'])
+evaluate_model(xgb_pce, X_test_1, y_test_1['PCE_ave(%)'])
+xgb_jsc = train_xgb(X_train_1, y_train_1['Jsc(mA/cm2)'])
+evaluate_model(xgb_jsc, X_test_1, y_test_1['Jsc(mA/cm2)'])
+xgb_voc = train_xgb(X_train_1, y_train_1['Voc(V)'])
+evaluate_model(xgb_voc, X_test_1, y_test_1['Voc(V)'])
+xgb_ff  = train_xgb(X_train_1, y_train_1['FF'])
+evaluate_model(xgb_ff, X_test_1, y_test_1['FF'])
+
+plot_feature_importance(xgb_pce, title_complement = "PCE", feature_names = X_1.columns)
+plot_feature_importance(xgb_jsc, title_complement = "Jsc", feature_names = X_1.columns)
+plot_feature_importance(xgb_voc, title_complement = "Voc", feature_names = X_1.columns)
+plot_feature_importance(xgb_ff, title_complement = "FF", feature_names = X_1.columns)
+
+print("\nResults NFA\n")
+xgb_pce = train_xgb(X_train_2, y_train_2['PCE_ave(%)'])
+evaluate_model(xgb_pce, X_test_2, y_test_2['PCE_ave(%)'])
+xgb_jsc = train_xgb(X_train_2, y_train_2['Jsc(mA/cm2)'])
+evaluate_model(xgb_jsc, X_test_2, y_test_2['Jsc(mA/cm2)'])
+xgb_voc = train_xgb(X_train_2, y_train_2['Voc(V)'])
+evaluate_model(xgb_voc, X_test_2, y_test_2['Voc(V)'])
+xgb_ff  = train_xgb(X_train_2, y_train_2['FF'])
+evaluate_model(xgb_ff, X_test_2, y_test_2['FF'])
+
+plot_feature_importance(xgb_pce, title_complement = "PCE")
+plot_feature_importance(xgb_jsc, title_complement = "Jsc")
+plot_feature_importance(xgb_voc, title_complement = "Voc")
+plot_feature_importance(xgb_ff, title_complement = "FF")
+
+
+
+""" LightGBoost """
+
+
+
+from lightgbm import LGBMRegressor
+
+def train_lgb(X_train, y_train):
+    '''
+    This function finds the best hyperparameters for a LightBoost Regressor.
+    It returns a final model trained in the training set with the best hyperparameters
+    Bayes Search 3-fold cross validation is used for optimization of the hyperparameters.
+    '''
+
+    lgbm = LGBMRegressor(random_state=42)
+
+    # Define parameter space
+    param_space_lgbm = {
+        'n_estimators': (100, 500),
+        'max_depth': (3, 10),
+        'learning_rate': (0.01, 1.0, 'log-uniform'),
+        'num_leaves': (31, 200),
+        'subsample': (0.5, 1.0),
+        'colsample_bytree': (0.5, 1.0)
+        }
+
+    # Set up Bayesian optimization for LightGBM
+    opt_lgbm = BayesSearchCV(
+        estimator=lgbm,
+        search_spaces=param_space_lgbm,
+        n_iter=100,                 # Number of parameter settings sampled
+        cv=3,                      # 3-fold cross-validation
+        n_jobs=-1,                 # Use all available cores
+        random_state=42
+        )
+
+    # Fit and evaluate LightGBM model
+    opt_lgbm.fit(X_train, y_train)
+    print("Best hyperparameters (LightGBM):", opt_lgbm.best_params_)
+    best_lgb = opt_lgbm.best_estimator_
+
+    return best_lgb
+
+print("\nResults FA+NFA\n")
+lgb_pce = train_lgb(X_train, y_train['PCE_ave(%)'])
+evaluate_model(lgb_pce, X_test, y_test['PCE_ave(%)'])
+lgb_jsc = train_lgb(X_train, y_train['Jsc(mA/cm2)'])
+evaluate_model(lgb_jsc, X_test, y_test['Jsc(mA/cm2)'])
+lgb_voc = train_lgb(X_train, y_train['Voc(V)'])
+evaluate_model(lgb_voc, X_test, y_test['Voc(V)'])
+lgb_ff  = train_lgb(X_train, y_train['FF'])
+evaluate_model(lgb_ff, X_test, y_test['FF'])
+
+print("\nResults FA\n")
+lgb_pce = train_lgb(X_train_1, y_train_1['PCE_ave(%)'])
+evaluate_model(lgb_pce, X_test_1, y_test_1['PCE_ave(%)'])
+lgb_jsc = train_lgb(X_train_1, y_train_1['Jsc(mA/cm2)'])
+evaluate_model(lgb_jsc, X_test_1, y_test_1['Jsc(mA/cm2)'])
+lgb_voc = train_lgb(X_train_1, y_train_1['Voc(V)'])
+evaluate_model(lgb_voc, X_test_1, y_test_1['Voc(V)'])
+lgb_ff  = train_lgb(X_train_1, y_train_1['FF'])
+evaluate_model(lgb_ff, X_test_1, y_test_1['FF'])
+
+plot_feature_importance(lgb_pce, title_complement = "PCE", feature_names = X_1.columns)
+plot_feature_importance(lgb_jsc, title_complement = "Jsc", feature_names = X_1.columns)
+plot_feature_importance(lgb_voc, title_complement = "Voc", feature_names = X_1.columns)
+plot_feature_importance(lgb_ff, title_complement = "FF", feature_names = X_1.columns)
+
+print("\nResults NFA\n")
+lgb_pce = train_lgb(X_train_2, y_train_2['PCE_ave(%)'])
+evaluate_model(lgb_pce, X_test_2, y_test_2['PCE_ave(%)'])
+lgb_jsc = train_lgb(X_train_2, y_train_2['Jsc(mA/cm2)'])
+evaluate_model(lgb_jsc, X_test_2, y_test_2['Jsc(mA/cm2)'])
+lgb_voc = train_lgb(X_train_2, y_train_2['Voc(V)'])
+evaluate_model(lgb_voc, X_test_2, y_test_2['Voc(V)'])
+lgb_ff  = train_lgb(X_train_2, y_train_2['FF'])
+evaluate_model(lgb_ff, X_test_2, y_test_2['FF'])
+
+plot_feature_importance(lgb_pce, title_complement = "PCE")
+plot_feature_importance(lgb_jsc, title_complement = "Jsc")
+plot_feature_importance(lgb_voc, title_complement = "Voc")
+plot_feature_importance(lgb_ff, title_complement = "FF")
