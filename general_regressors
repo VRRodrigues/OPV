@@ -2,7 +2,7 @@
 """
 @author: vicre
 
-This code is train and optimize the hyperparameters of the following regression models:
+This code is made for training and optimization of the hyperparameters of the following regression models:
   - Support Vector Regressor (SVR)
   - k-NN Regressor (k-NN)
   - Kernel Ridge Regressor (KRR)
