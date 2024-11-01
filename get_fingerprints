@@ -1,0 +1,103 @@
+# -*- coding: utf-8 -*-
+"""
+@author: vicre
+
+This code extracts the SMILES codes from the datasets and generate a file "fingerprints.csv"
+with the data (SMILES, CDK Fingerprint, RDKit Fingerprint, Morgan Fingerprint)
+
+It also generates a second file containing the cases in which the fingerprint obtention process might have failed
+
+"""
+
+from rdkit import Chem
+from rdkit.Chem import RDKFingerprint
+from rdkit.Chem import rdFingerprintGenerator
+import pandas as pd
+from CDK_pywrapper import CDK, FPType
+from tqdm import tqdm
+
+#### Getting the SMILES code ####
+
+df1 = pd.read_csv('NFA_Polymer.txt', delimiter='\t')
+smiles_NFA = list(set(df['n(SMILES)']).union(set(df['p(SMILES)'])))
+
+df2 = pd.read_csv('FA_Polymer.txt', delimiter='\t', encoding='windows-1252')
+smiles_FA = list(set(list(df['SMILES'])))
+
+smiles_list = smiles_FA + smiles_NFA
+
+#### Get the fingerprints ####
+
+# Initialize CDK
+cdk = CDK(fingerprint=FPType.FP,nbits=1024, depth=6)
+
+# Initialize Morgan
+mfpgen = rdFingerprintGenerator.GetMorganGenerator(radius=2,fpSize=2048)
+
+# Functions to calculate fingerprints
+def calculate_fingerprints(mol):
+    try:
+        # Calculate fingerprints
+        cdk_fp = ''.join(cdk.calculate([mol]).astype(str).values.flatten())
+        rdkit_fp = ''.join(['1' if bit else '0' for bit in RDKFingerprint(mol)])
+        morgan_fp = ''.join(['1' if bit else '0' for bit in mfpgen.GetFingerprint(mol)])
+        
+        return cdk_fp, rdkit_fp, morgan_fp
+    except Exception as e:
+        return str(e), str(e), str(e)
+
+# Dictionary to store results and failed cases
+fingerprints = {}
+failed_cases = []
+
+# Process each SMILES string
+for smiles in tqdm(smiles_list, desc="Processing SMILES"):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        failed_cases.append(f"Invalid SMILES: {smiles}")
+        continue
+    try:
+        mol = Chem.AddHs(mol)
+    except Exception as e:
+        failed_cases.append(f"Error adding hydrogens to SMILES {smiles}: {str(e)}")
+        continue
+    
+    cdk_fp, rdkit_fp, morgan_fp = calculate_fingerprints(mol)
+    
+    if "Error" in cdk_fp:
+        failed_cases.append({
+            "SMILES": smiles,
+            "CDK Fingerprint": cdk_fp,
+            "RDKit Fingerprint": rdkit_fp,
+            "Morgan Fingerprint": morgan_fp
+        })
+    else:
+        fingerprints[smiles] = {
+            "CDK Fingerprint": cdk_fp,
+            "RDKit Fingerprint": rdkit_fp,
+            "Morgan Fingerprint": morgan_fp
+        }
+
+# Directory in which to save the files
+output_dir= "..."
+
+# Write results to files
+with open(os.path.join(output_dir,"fingerprints.csv"), "w") as file:
+    file.write("SMILES, CDK Fingerprint, RDKit Fingerprint, Morgan Fingerprint\n")
+    for smiles, fps in fingerprints.items():
+        file.write("{smiles},{fps['CDK Fingerprint']},{fps['RDKit Fingerprint']},{fps['Morgan Fingerprint']}\n")
+
+# This part writes the cases in which it wasn't possible to obtain the fingerprints
+with open(os.path.join(output_dir,"failed_cases.txt"), "w") as file:
+    for case in failed_cases:
+        if isinstance(case, dict):
+            file.write(f"SMILES: {case['SMILES']}\n")
+            file.write(f"CDK Fingerprint: {case['CDK Fingerprint']}\n")
+            file.write(f"RDKit Fingerprint: {case['RDKit Fingerprint']}\n")
+            file.write(f"Morgan Fingerprint: {case['Morgan Fingerprint']}\n\n")
+        else:
+            file.write(f"{case}\n")
+
+# Print success messages
+print("Fingerprints have been saved to fingerprints.csv")
+print("Failed cases have been saved to failed_cases.txt")
