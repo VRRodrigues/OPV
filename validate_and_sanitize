@@ -1,0 +1,60 @@
+"""
+@author: vicre
+
+This code verifies the SMILES codes to validate and sanitize them
+The problematic molecules are displayed in a terminal and saved in a file for further analysis
+
+"""
+import pandas as pd
+from rdkit import Chem
+
+#### Getting the SMILES code ####
+
+df1 = pd.read_csv('NFA_Polymer.txt', delimiter='\t')
+smiles_NFA = list(set(df['n(SMILES)']).union(set(df['p(SMILES)'])))
+df2 = pd.read_csv('FA_Polymer.txt', delimiter='\t', encoding='windows-1252')
+smiles_FA = list(set(list(df['SMILES'])))
+smiles_list = smiles_FA + smiles_NFA
+
+# Function to validate and sanitize the molecules
+def validate_and_sanitize(smiles):
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Invalid SMILES: {smiles}")
+            return None
+       
+        # Try to add hydrogens and catch warnings/errors
+        try:
+            mol = Chem.AddHs(mol)
+        except Exception as e:
+            print(f"Error while adding hydrogens for {smiles}: {e}")
+        
+        # Sanitize molecule and catch errors
+        try:
+            Chem.SanitizeMol(mol)
+        except Exception as e:
+            print(f"Sanitization failed for {smiles}: {e}")
+
+        try:
+            mol_no_hs = Chem.RemoveHs(mol)
+        except Exception as e:
+            print(f"Problem with {smiles}: {e}")
+            problematic_molecules.append(smiles)
+
+        return mol
+
+    except Exception as e:
+        print(f"An error occurred with SMILES {smiles}: {e}")
+        return None
+
+# Track molecules that trigger warnings
+problematic_molecules = []
+
+for smiles in smiles_list:
+    try:
+        mol = validate_and_sanitize(smiles)
+    except Exception as e:
+        problematic_molecules.append(smiles)
+
+print(f"Problematic molecules: {problematic_molecules}")
