@@ -241,6 +241,24 @@ with torch.no_grad():
 
 print(f'Test Loss: {test_loss.item():.4f}')
 
+#### Saving the results ####
+
+# Path to the output file
+output_file = 'autoencoder_results.txt'
+
+# Write the results to the file
+with open(output_file, 'w') as f:
+    f.write('Best Trial:\n')
+    f.write(f'Validation Loss (Optuna): {trial.value:.6f}\n\n')
+    
+    f.write('Best Hyperparameters:\n')
+    for key, value in best_params.items():
+        f.write(f'{key}: {value}\n')
+    
+    f.write(f'\nTest Loss: {test_loss.item():.6f}\n')
+
+print(f"\nResults saved to '{output_file}'")
+
 #### Compressing the Data ####
 
 X_tensor = torch.tensor(np.array([convert_to_binary_vector(fp) for fp in X.values]), dtype=torch.float32).to(device)
