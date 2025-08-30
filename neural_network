@@ -1,35 +1,44 @@
 # -*- coding: utf-8 -*-
 """
+Created on Sat Oct  5 13:12:07 2024
 @author: vicre
 
-This code is destined to optimize the hyperparameters of a Neural Network and then 
-use them for training a final model effectively used for OSC device parameters prediction
+Neural Network Hyperparameter Optimization for Organic Solar Cell (OSC) Device Prediction
 
-Optuna is used for hyperparameter optimizaton
-Dropout and L2 regularization are used
-Cross-validation is used in the hyperparameter optimization process
-Residual connections and Batch Norm layers are implemented for favoring the flow of gradients
-Adam optimizer was used for gradient descent
-
+This script:
+- Loads and preprocesses OSC datasets (FA-Polymer and NFA-Polymer)
+- Optimizes hyperparameters of a Neural Network using Optuna
+- Implements a residual network with batch normalization, dropout, and L2 regularization
+- Uses k-fold cross-validation during optimization
+- Trains a final model with the best hyperparameters
+- Evaluates the model on a hold-out test set and computes performance metrics
 """
-import pandas as pd
-import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+import optuna
 from sklearn.model_selection import KFold
+from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import numpy as np
 from scipy.stats import pearsonr
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import optuna
+
+# ------------------------------------------------------------------------------
+# DEVICE CONFIGURATION
+# ------------------------------------------------------------------------------
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using device: {device}')
 
-#### Preprocessing Data ####
+# ------------------------------------------------------------------------------
+# DATA LOADING & PREPROCESSING
+# ------------------------------------------------------------------------------
 
+# Load FA-Polymer dataset, clean columns, convert numeric fields, and drop missing values
 df1 = pd.read_csv('final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
 df1 = df1.rename(columns={'PDI(=Mw/Mn)': 'PDI', 'Monomer(g/m)':'M(g/mol)'})
 df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].replace('-', np.nan)
@@ -37,24 +46,24 @@ df1[['Mn(kg/mol)', 'PDI']] = df1[['Mn(kg/mol)', 'PDI']].apply(pd.to_numeric, err
 df1= df1.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
 df1 = df1.dropna()
 
+# Load NFA-Polymer dataset and apply similar cleaning
 df2 = pd.read_csv('final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
 df2 = df2.drop(['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)'], axis=1)
 df2 = df2.dropna()
 
+# Merge datasets and shuffle rows
 df = pd.concat([df1, df2], ignore_index=True)
-df = df.sample(frac=1).reset_index(drop=True) # It shuffles the data in df
+df = df.sample(frac=1).reset_index(drop=True)
 
 X = df[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']]
 y = df[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
-X_1 = df1[['M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']]
+X_1 = df1[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']]
 y_1 = df1[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
 X_2 = df2[['-HOMO_n(eV)', '-LUMO_n(eV)', 'Eg_n(eV)', 'M(g/mol)', '-HOMO_p(eV)', '-LUMO_p(eV)', 'Eg_p(eV)', 'Mw(kg/mol)', 'Mn(kg/mol)', 'PDI']]
 y_2 = df2[['PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']]
 
-# Splitting the data into training and test set
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Scaling of the data
 scaler_X = StandardScaler()
 X_train = scaler_X.fit_transform(X_train)
 X_test = scaler_X.transform(X_test)
@@ -69,8 +78,17 @@ y_train_tensor = torch.tensor(y_train, dtype=torch.float32).to(device)
 X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
 y_test_tensor = torch.tensor(y_test, dtype=torch.float32).to(device)
 
-# Neural network model with residual connections, batch normalization, dropout  
+# ------------------------------------------------------------------------------
+# NEURAL NETWORK MODEL DEFINITION
+# ------------------------------------------------------------------------------
 class ResidualNet(nn.Module):
+    """
+    Fully-connected Residual Network with:
+    - Batch Normalization
+    - Dropout for regularization
+    - Residual connection between input and third hidden layer
+    - 10 input features, 4 output targets
+    """
     def __init__(self, dropout_rate):
         super(ResidualNet, self).__init__()
         self.fc1 = nn.Linear(10, 64)  # 10 input features, 64 hidden units
@@ -99,9 +117,16 @@ class ResidualNet(nn.Module):
 
 epochs = 100
 
-# Training and cross-validation
+# ------------------------------------------------------------------------------
+# TRAINING FUNCTION WITH CROSS-VALIDATION
+# ------------------------------------------------------------------------------
+
 def train_and_evaluate(lr, weight_decay, dropout_rate):
-    kf = KFold(n_splits=5)
+    """
+    Train and evaluate the model using k-fold cross-validation.
+    Returns the mean validation loss across folds.
+    """
+    kf = KFold(n_splits=3)
     criterion = nn.MSELoss()  # Mean Squared Error for regression
     batch_size = 32
     total_val_loss = 0
@@ -138,6 +163,10 @@ def train_and_evaluate(lr, weight_decay, dropout_rate):
 
     return total_val_loss / kf.get_n_splits()
 
+# ------------------------------------------------------------------------------
+# OPTUNA HYPERPARAMETER OPTIMIZATION
+# ------------------------------------------------------------------------------
+
 # Optuna objective function
 def objective(trial):
     lr = trial.suggest_float('lr', 1e-5, 1, log=True)
@@ -153,7 +182,11 @@ study.optimize(objective, n_trials=200)
 print(f'Best hyperparameters: {study.best_params}')
 print(f'Best validation loss: {study.best_value}')
 
-# Training of a model with the best hyperparameters on the entire training set
+# ------------------------------------------------------------------------------
+# FINAL TRAINING WITH BEST HYPERPARAMETERS
+# ------------------------------------------------------------------------------
+
+# Train on entire training set with the best hyperparameters and save model
 best_model = ResidualNet(dropout_rate=study.best_params['dropout_rate']).to(device)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(best_model.parameters(), lr=study.best_params['lr'], weight_decay=study.best_params['weight_decay'])
@@ -172,7 +205,10 @@ for epoch in range(epochs):
         loss.backward()
         optimizer.step()
 
-# Evaluation on the test set
+# ------------------------------------------------------------------------------
+# MODEL EVALUATION ON TEST SET
+# ------------------------------------------------------------------------------
+
 best_model.eval()
 with torch.no_grad():
     predictions = best_model(X_test_tensor)
@@ -195,7 +231,7 @@ with torch.no_grad():
         # Pearson correlation
         pearson_corr, _ = pearsonr(y_true, y_predicted)
         # RMSE
-        rmse = mean_squared_error(y_true, y_predicted, squared=False)
+        rmse = np.sqrt(mean_squared_error(y_true, y_predicted))
         # MAE
         mae = mean_absolute_error(y_true, y_predicted)
         # R^2
@@ -216,9 +252,11 @@ with torch.no_grad():
             print(f"  {metric_name}: {value:.4f}")
         print()
 
-#### Saving the results ####
+# ------------------------------------------------------------------------------
+# SAVING RESULTS AS A LATEX TABLE
+# ------------------------------------------------------------------------------
 
-# Begin LaTeX table string
+# Begin constructing a LaTeX table for metrics
 latex_str = r'''\begin{table}[ht]
 \centering
 \caption{Neural Network Metrics for OPV Properties}
@@ -227,29 +265,34 @@ latex_str = r'''\begin{table}[ht]
 Property & Pearson & RMSE & MAE & $R^2$ \\
 \midrule
 '''
-# Add data rows
+
+# Loop through each property and add a row with metrics
 for prop, vals in metrics.items():
     latex_str += f"{prop} & {vals['Pearson']:.4f} & {vals['RMSE']:.4f} & {vals['MAE']:.4f} & {vals['R2']:.4f} \\\\\n"
-# Add bottomrule and closing
+
+# Close the table
 latex_str += r'''\bottomrule
 \end{tabular}
 \end{table}
 '''
 
-# Add test loss and Optuna info
+# Append additional information about hyperparameters and losses as LaTeX comments
 latex_str += '\n\n% Best hyperparameters and loss information\n'
 latex_str += f"% Best hyperparameters: {study.best_params}\n"
 latex_str += f"% Best validation loss: {study.best_value:.6f}\n"
 latex_str += f"% Test loss: {test_loss.item():.6f}\n"
 
-# Save to file
+# Write the LaTeX string to a file
 with open("neural_network_results.tex", "w", encoding="utf-8") as f:
     f.write(latex_str)
 
-#### Saving the final model ####
+# ------------------------------------------------------------------------------
+# TRAINING FINAL MODEL ON FULL DATASET AND SAVING IT
+# ------------------------------------------------------------------------------
 
-X_all_tensor = torch.tensor(X, dtype=torch.float32).to(device)
-y_all_tensor = torch.tensor(y, dtype=torch.float32).to(device)
+# Convert the entire dataset to PyTorch tensors for training
+X_all_tensor = torch.tensor(X.values, dtype=torch.float32).to(device)
+y_all_tensor = torch.tensor(y.values, dtype=torch.float32).to(device)
 train_dataset = TensorDataset(X_all_tensor, y_all_tensor)
 train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True)
 
