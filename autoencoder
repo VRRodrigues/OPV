@@ -1,16 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-@author: vicre
+Autoencoder Hyperparameter Optimization for Molecular Fingerprints
+=================================================================
 
-This code is destined to optimize the hyperparameters of an Autoencoder Neural Network used
-to compress fingerprints to a 32-dimensional latent representation, and then use those
-hyperparameters for training a final model effectively used for the data compression
+Author: vicre
+Created: Wed Oct 9 23:09:15 2024
 
-Optuna is used for hyperparameter optimizaton
-Dropout and L2 regularization are used
-Residual connections and Batch Norm layers are implemented for favoring the flow of gradients
-Adam optimizer was used for gradient descent
+Description:
+------------
+This script performs hyperparameter optimization of an Autoencoder neural network
+using Optuna. The Autoencoder is used to compress molecular fingerprints into a 
+32-dimensional latent representation. Once the best hyperparameters are found, 
+the final model is trained for effective data compression.
 
+Main Features:
+--------------
+- **Optuna** for hyperparameter optimization
+- **Dropout** and **L2 regularization** for reducing overfitting
+- **Residual connections** and **Batch Normalization** to improve gradient flow
+- **Adam optimizer** for gradient descent
+- **Reproducibility** ensured by setting random seeds
 """
 
 import optuna
@@ -21,63 +30,97 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 import pandas as pd
 import numpy as np
+import random
 
-#### Preprocessing data ####
+# ----------------------------- #
+# 1. SEEDING FOR REPRODUCIBILITY
+# ----------------------------- #
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True # Ensures reproducible results
+    torch.backends.cudnn.benchmark = False    # Disables auto-optimizations that vary across runs
 
+# ----------------------------- #
+# 2. DATA LOADING & PREPROCESSING
+# ----------------------------- #
 '''
-The final databases have the following column informations:
-    FA: ID (a number indexing the D/A pairs), Nickname (of the donor molecule), Reference, PCE_max(%),
-      PCE_ave(%), Voc(V), Jsc(mA/cm2), FF, Mw(kg/mol), Mn(kg/mol), PDI(=Mw/Mn), Monomer(g/m),
-      -HOMO_p(eV), -LUMO_p(eV), Eg_p(eV), p(CDK Fingerprint), p(RDKit Fingerprint), p(Morgan Fingerprint)
-      -HOMO_n(eV), -LUMO_n(eV), Eg_n(eV), n(RDKit Fingerprint), n(Morgan Fingerprint), n(CDK Fingerprint)
+Datasets:
+---------
+FA dataset columns:
+    FA: ID, Nickname, Reference, PCE_max(%), PCE_ave(%), Voc(V), Jsc(mA/cm2), FF,
+        Mw, Mn, PDI, Monomer, HOMO/LUMO levels, Eg, p(CDK/RDKit/Morgan FPs), 
+        Acceptor, n(CDK/RDKit/Morgan FPs)
 
+NFA dataset columns:
     NFA: ID, Ref, PCE_max(%), PCE_ave(%), Jsc(mA/cm2), FF, Voc(V),
-       -HOMO_n(eV), -LUMO_n(eV), Eg_n(eV), n(SMILES), M(g/mol),
-       -HOMO_p(eV), -LUMO_p(eV), Eg_p(eV), p(SMILES), Mw(kg/mol),
-       Mn(kg/mol), PDI, n(CDK Fingerprint), n(RDKit Fingerprint),
-       n(Morgan Fingerprint), p(CDK Fingerprint), p(RDKit Fingerprint),
-       p(Morgan Fingerprint)
+         HOMO/LUMO levels, Eg, SMILES, Mw, Mn, PDI, 
+         n(CDK/RDKit/Morgan FPs), p(CDK/RDKit/Morgan FPs)
 '''
 
 def is_binary(fp):
+    """Check whether a given fingerprint string consists only of 0s and 1s."""
     return isinstance(fp, str) and all(char in '01' for char in fp)
 
-df1 = pd.read_csv('final_database_FA.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+# --- Load FA dataset ---
+df1 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\FA_Polymer\final_database_FA_with_acceptor_fp.csv', delimiter=',').drop(['ID', 'Nickname', 'Ref'], axis=1)
+# Keep only rows where all fingerprints are valid binary strings
 df1 = df1[df1[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
-df1['CDK_fp'] = df1['n(CDK Fingerprint)'] + df1['p(CDK Fingerprint)']
-df1['RDKit_fp'] = df1['n(RDKit Fingerprint)'] + df1['p(RDKit Fingerprint)']
+# Concatenate donor & acceptor fingerprints into combined features
+df1['CDK_fp']    = df1['n(CDK Fingerprint)'] + df1['p(CDK Fingerprint)']
+df1['RDKit_fp']  = df1['n(RDKit Fingerprint)'] + df1['p(RDKit Fingerprint)']
 df1['Morgan_fp'] = df1['n(Morgan Fingerprint)'] + df1['p(Morgan Fingerprint)']
+# Select only relevant columns
 df1 = df1[['CDK_fp', 'RDKit_fp', 'Morgan_fp', 'PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']].reset_index(drop=True)
 
-df2 = pd.read_csv('final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
+# --- Load NFA dataset ---
+df2 = pd.read_csv(r'D:\Ciências\Unb\Pibic OPV\Computation and Scripts\Computation and Scripts\Dataset\NFA_Polymer\final_database_NFA.csv', delimiter=',').drop(['ID', 'Ref', 'n(SMILES)', 'p(SMILES)'], axis=1)
 df2 = df2[df2[['n(CDK Fingerprint)', 'p(CDK Fingerprint)', 'n(RDKit Fingerprint)', 'p(RDKit Fingerprint)', 'n(Morgan Fingerprint)', 'p(Morgan Fingerprint)']].apply(lambda x: x.map(is_binary)).all(axis=1)]
 df2['CDK_fp']    = df2['n(CDK Fingerprint)'] + df2['p(CDK Fingerprint)']
 df2['RDKit_fp']  = df2['n(RDKit Fingerprint)'] + df2['p(RDKit Fingerprint)']
 df2['Morgan_fp'] = df2['n(Morgan Fingerprint)'] + df2['p(Morgan Fingerprint)']
 df2 = df2[['CDK_fp', 'RDKit_fp', 'Morgan_fp', 'PCE_ave(%)', 'Jsc(mA/cm2)', 'FF', 'Voc(V)']].reset_index(drop=True)
 
+# Combine FA and NFA datasets into one dataframe
 df = pd.concat([df1, df2], ignore_index=True)
 df = df.sample(frac=1).reset_index(drop=True)
 
+# Extract Morgan fingerprints as the primary feature set
 X = df['Morgan_fp']
 
 def convert_to_binary_vector(fp_str):
-    return [int(bit) for bit in fp_str]
+    """Convert a binary string fingerprint into a list of integers (0/1)."""
+    if all(bit in '01' for bit in fp_str):
+        return [int(bit) for bit in fp_str]
+    else:
+        raise ValueError(f"Invalid fingerprint format: {fp_str}")
 
-# Convert fingerprints to binary vectors
+# Convert all fingerprints to numeric binary vectors
 try:
     binary_vectors = np.array([convert_to_binary_vector(fp) for fp in X.values])
 except ValueError as e:
     print(e)
 
-# Split data (use the binary_vectors array for splitting)
+# ----------------------------- #
+# 3. TRAIN/VALIDATION/TEST SPLIT
+# ----------------------------- #
+# # Split dataset into training+validation and test sets (80/20 split)
 X_train_val, X_test = train_test_split(binary_vectors, test_size=0.2, random_state=42)
+
+# Further split training+validation set into training and validation (80/20 split)
 X_train, X_val = train_test_split(X_train_val, test_size=0.2, random_state=42)
 
-# Define the device
+# ----------------------------- #
+# 4. TENSOR CONVERSION & DEVICE SETUP
+# ----------------------------- #
+# Select GPU if available, else fallback to CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Convert to PyTorch tensors and move to GPU (if available)
+# Convert numpy arrays to PyTorch tensors and move them to the chosen device
 X_train_val_tensor = torch.tensor(X_train_val, dtype=torch.float32).to(device)
 X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
 X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
@@ -85,7 +128,10 @@ X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
 
 print(f"Training on: {device}")
 
-# Define the autoencoder with dropout rate as a hyperparameter
+# -----------------------------------------------------------
+# 5. AUTOENCODER DEFINITION & HYPERPARAMETER OPTIMIZATION (OPTUNA)
+# -----------------------------------------------------------
+# Define the autoencoder with dropout as a hyperparameter
 class FingerprintAutoencoder(nn.Module):
     def __init__(self, input_dim, embedding_dim, dropout_rate):
         super(FingerprintAutoencoder, self).__init__()
@@ -162,11 +208,21 @@ class FingerprintAutoencoder(nn.Module):
         decoded = self.decode(encoded)
         return encoded, decoded
 
-embedding_dim = 32
-epochs = 100
+# ----------------------------- #
+# 6. HYPERPARAMETER OPTIMIZATION
+# ----------------------------- #
+embedding_dim = 32  # Latent space dimension
+epochs = 100        # Training epochs per trial
 
 # Optuna objective function
 def objective(trial):
+    """
+    Optuna objective function for hyperparameter optimization.
+
+    Returns:
+    --------
+    Validation loss (float) to be minimized by Optuna.
+    """
     # Hyperparameters to tune
     dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.9)  # Dropout rate
     learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)  # Learning rate
@@ -201,7 +257,7 @@ study = optuna.create_study(direction='minimize')
 # Run the optimization
 study.optimize(objective, n_trials=200)
 
-# Print the best hyperparameters
+# Display the best hyperparameters
 print('Best trial:')
 trial = study.best_trial
 print(f'Loss: {trial.value}')
@@ -209,12 +265,14 @@ best_params = study.best_trial.params
 print("Best hyperparameters found by Optuna:")
 print(best_params)
 
-# Best hyperparameters
+# ----------------------------- #
+# 7. FINAL TRAINING WITH BEST PARAMS
+# ----------------------------- #
+# Train the final model using the best hyperparameters on full train+val set
 best_dropout_rate = best_params['dropout_rate']
 best_learning_rate = best_params['learning_rate']
 best_weight_decay = best_params['weight_decay']
 
-# Initialize the model with the best hyperparameters
 final_model = FingerprintAutoencoder(input_dim=X_train_tensor.shape[1], embedding_dim=embedding_dim, dropout_rate=best_dropout_rate).to(device)
 
 # Optimizer and loss function with the best hyperparameters
@@ -233,7 +291,7 @@ for epoch in range(epochs):
     if (epoch + 1) % 10 == 0:
         print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}')
 
-# Evaluate on the test set
+# Evaluation on the test set
 final_model.eval()
 with torch.no_grad():
     _, test_reconstructed = final_model(X_test_tensor)
@@ -241,7 +299,13 @@ with torch.no_grad():
 
 print(f'Test Loss: {test_loss.item():.4f}')
 
-#### Saving the results ####
+# -----------------------------------------------------------
+# RESULTS SAVING, DATA COMPRESSION & MODEL SERIALIZATION
+# -----------------------------------------------------------
+
+# ----------------------------- #
+# 1. SAVE RESULTS TO FILE
+# ----------------------------- #
 
 # Path to the output file
 output_file = 'autoencoder_results.txt'
@@ -259,27 +323,35 @@ with open(output_file, 'w') as f:
 
 print(f"\nResults saved to '{output_file}'")
 
-#### Compressing the Data ####
+# ----------------------------- #
+# 2. COMPRESS DATA USING TRAINED ENCODER
+# ----------------------------- #
 
+# Convert original Morgan fingerprints into a tensor for encoding
 X_tensor = torch.tensor(np.array([convert_to_binary_vector(fp) for fp in X.values]), dtype=torch.float32).to(device)
 
-# Get the encoded representation using the loaded encoder
+# Pass data through the trained encoder to obtain latent representations
 with torch.no_grad():
-    encoded_data = final_model.encode(X_tensor)
+    encoded_data = final_model.encode(X_tensor)  # Only capture a single output
 
 # Convert encoded data to numpy array and create DataFrame
 encoded_df = pd.DataFrame(encoded_data.cpu().numpy())
 
-# Concatenate the encoded DataFrame with the original DataFrame X
-combined_df = pd.concat([X, encoded_df], axis=1)
+# Combine the original fingerprint strings with their encoded representation
+# (keeps track of which compressed vector corresponds to which molecule)
+combined_df = pd.concat([X.to_frame(), encoded_df], axis=1)  # Ensure X is a DataFrame
+
+# Save the combined dataset to a CSV file
 combined_df.to_csv('combined_data.csv', index=False)
 
-#### Saving the model ####
+# ----------------------------- #
+# 3. SAVE TRAINED MODEL
+# ----------------------------- #
 
-# Save the entire autoencoder model
+# Save the full autoencoder (entire architecture + trained weights)
 torch.save(final_model.state_dict(), 'autoencoder_model.pth')
 
-# Save encoder and decoder parts by accessing their layers directly
+# Additionally, save encoder and decoder weights separately
 encoder_state_dict = {
     'encoder_fc1': final_model.encoder_fc1.state_dict(),
     'encoder_bn1': final_model.encoder_bn1.state_dict(),
@@ -303,10 +375,10 @@ decoder_state_dict = {
 torch.save(encoder_state_dict, 'encoder.pth')
 torch.save(decoder_state_dict, 'decoder.pth')
 
-#### Loading a model previously saved ####
-
+#### Loading ####
 '''
 model = FingerprintAutoencoder(input_dim, embedding_dim, dropout_rate)
+
 model.load_state_dict(torch.load('autoencoder_model.pth'))
 
 # Load the encoder and decoder weights back into the model
@@ -325,4 +397,30 @@ model.decoder_bn2.load_state_dict(torch.load('decoder.pth')['decoder_bn2'])
 model.decoder_fc3.load_state_dict(torch.load('decoder.pth')['decoder_fc3'])
 model.decoder_bn3.load_state_dict(torch.load('decoder.pth')['decoder_bn3'])
 model.decoder_fc4.load_state_dict(torch.load('decoder.pth')['decoder_fc4'])
+'''
+
+
+'''
+# Load the saved encoder model
+encoder = FingerprintAutoencoder(input_dim=X_train_tensor.shape[1], embedding_dim=embedding_dim, dropout_rate=best_dropout_rate).to(device)
+encoder.load_state_dict(torch.load('encoder.pth'))
+
+# Convert the 'Morgan_fp' column to binary vectors
+binary_vectors = np.array([convert_to_binary_vector(fp) for fp in X.values])
+
+# Convert to PyTorch tensor and move to GPU
+X_tensor = torch.tensor(binary_vectors, dtype=torch.float32).to(device)
+
+# Get the encoded representation using the loaded encoder
+with torch.no_grad():
+    encoded_data, _ = encoder(X_tensor)
+
+# Convert encoded data to numpy array and create DataFrame
+encoded_df = pd.DataFrame(encoded_data.cpu().numpy())
+
+# Concatenate the encoded DataFrame with the original DataFrame X
+combined_df = pd.concat([X.to_frame(), encoded_df], axis=1)
+
+# Save the combined DataFrame to a CSV file
+combined_df.to_csv('combined_data.csv', index=False)
 '''
