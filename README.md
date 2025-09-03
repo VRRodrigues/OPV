@@ -7,4 +7,4 @@ The primary datasets were sourced from the following publications:
 1) https://pubs.acs.org/doi/10.1021/acs.jpclett.1c03526
 2) https://pubs.acs.org/doi/10.1021/acs.jpclett.8b00635
 
-Since the exact acceptor used in each donor–acceptor pair of the original FA dataset was not provided, this information was manually collected from the 503 references cited in the dataset.
+Since the exact acceptor used in each donor–acceptor pair of the original FA dataset was not provided, that information was manually collected from the 503 references cited in the dataset.
