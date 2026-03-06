@@ -1,5 +1,5 @@
 # OPV
-Codes used for applying Machine Learning to the prediction of device parameters of Organic Photovoltaic Cells
+Codes used in the work "Machine learning-driven prediction of organic solar cell performance: a data-centric approach to molecular design" published at Springer Nature, Journal of Molecula Modelling: https://link.springer.com/article/10.1007/s00894-025-06514-5
 
 The parameters predicted were: Power Conversion Efficiency (PCE), Short Circuit Current (Jsc), Open Circuit Voltage (Voc) and Fill Factor (FF).
 
